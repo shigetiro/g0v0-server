@@ -1,5 +1,4 @@
-from datetime import datetime, timedelta
-import sys
+from datetime import timedelta
 from typing import Annotated, Literal
 
 from app.config import settings
@@ -9,7 +8,6 @@ from app.database import (
     BeatmapModel,
     BeatmapPlaycounts,
     BeatmapsetModel,
-    FavouriteBeatmapset,
     User,
 )
 from app.database.beatmap_playcounts import BeatmapPlaycountsModel
@@ -23,7 +21,6 @@ from app.dependencies.database import Database, get_redis
 from app.dependencies.user import get_current_user, get_optional_user
 from app.helpers.asset_proxy_helper import asset_proxy_response
 from app.log import log
-from app.models.error import ErrorType, RequestError
 from app.models.mods import API_MODS
 from app.models.score import GameMode
 from app.models.user import BeatmapsetType
@@ -32,8 +29,8 @@ from app.utils import api_doc, utcnow
 
 from .router import router
 
-from fastapi import BackgroundTasks, Path, Query, Request, Security
-from sqlmodel import exists, select, tuple_
+from fastapi import BackgroundTasks, HTTPException, Path, Query, Request, Security
+from sqlmodel import exists, false, select
 from sqlmodel.sql.expression import col
 
 
@@ -143,39 +140,20 @@ async def get_users(
 async def get_user_events(
     session: Database,
     user_id: Annotated[int, Path(description="用户 ID")],
-    limit: Annotated[int, Query(description="限制返回的活动数量")] = 50,
+    limit: Annotated[int | None, Query(description="限制返回的活动数量")] = None,
     offset: Annotated[int | None, Query(description="活动日志的偏移量")] = None,
     current_user: User | None = Security(get_optional_user, scopes=["public"]),
 ):
     db_user = await session.get(User, user_id)
     if db_user is None or not await visible_to_current_user(db_user, current_user, session):
-        raise RequestError(ErrorType.USER_NOT_FOUND)
-    if offset is None:
-        offset = 0
-    if limit > 100:
-        limit = 100
-
-    if offset == 0:
-        cursor = sys.maxsize
-    else:
-        cursor = (
-            await session.exec(
-                select(Event.id)
-                .where(Event.user_id == db_user.id, Event.created_at >= utcnow() - timedelta(days=30))
-                .order_by(col(Event.id).desc())
-                .limit(1)
-                .offset(offset - 1)
-            )
-        ).first()
-        if cursor is None:
-            return []
-
+        raise HTTPException(404, "User Not found")
     events = (
         await session.exec(
             select(Event)
-            .where(Event.user_id == db_user.id, Event.created_at >= utcnow() - timedelta(days=30), Event.id < cursor)
-            .order_by(col(Event.id).desc())
+            .where(Event.user_id == db_user.id, Event.created_at >= utcnow() - timedelta(days=30))
+            .order_by(col(Event.created_at).desc())
             .limit(limit)
+            .offset(offset)
         )
     ).all()
     return events
@@ -204,7 +182,7 @@ async def get_user_kudosu(
     # 验证用户是否存在
     db_user = await session.get(User, user_id)
     if db_user is None or not await visible_to_current_user(db_user, current_user, session):
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+        raise HTTPException(404, "User not found")
 
     # TODO: 实现 kudosu 记录获取逻辑
     return []
@@ -242,18 +220,18 @@ async def get_user_beatmaps_passed(
     if not beatmapset_ids:
         return {"beatmaps_passed": []}
     if len(beatmapset_ids) > 50:
-        raise RequestError(ErrorType.BEATMAPSET_IDS_TOO_MANY)
+        raise HTTPException(status_code=413, detail="beatmapset_ids cannot exceed 50 items")
 
     user = await session.get(User, user_id)
     if user is None or not await visible_to_current_user(user, current_user, session):
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+        raise HTTPException(404, detail="User not found")
 
     allowed_mode: GameMode | None = None
     if ruleset_id is not None:
         try:
             allowed_mode = GameMode.from_int_extra(ruleset_id)
         except KeyError as exc:
-            raise RequestError(ErrorType.INVALID_RULESET_ID) from exc
+            raise HTTPException(status_code=422, detail="Invalid ruleset_id") from exc
 
     score_query = (
         select(Score.beatmap_id, Score.mods, Score.gamemode, Beatmap.mode)
@@ -338,11 +316,11 @@ async def get_user_info_ruleset(
         )
     ).first()
     if not searched_user or searched_user.id == BANCHOBOT_ID:
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+        raise HTTPException(404, detail="User not found")
     searched_is_self = current_user is not None and current_user.id == searched_user.id
     should_not_show = not searched_is_self and await searched_user.is_restricted(session)
     if should_not_show:
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+        raise HTTPException(404, detail="User not found")
 
     user_resp = await UserModel.transform(
         searched_user,
@@ -391,11 +369,11 @@ async def get_user_info(
         )
     ).first()
     if not searched_user or searched_user.id == BANCHOBOT_ID:
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+        raise HTTPException(404, detail="User not found")
     searched_is_self = current_user is not None and current_user.id == searched_user.id
     should_not_show = not searched_is_self and await searched_user.is_restricted(session)
     if should_not_show:
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+        raise HTTPException(404, detail="User not found")
 
     user_resp = await UserModel.transform(
         searched_user,
@@ -430,7 +408,8 @@ async def get_user_beatmapsets(
     cache_service: UserCacheService,
     user_id: Annotated[int, Path(description="用户 ID")],
     type: Annotated[BeatmapsetType, Path(description="谱面集类型")],
-    current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
+    # Allow optional authentication so most-played can be viewed publicly.
+    current_user: Annotated[User | None, Security(get_optional_user, scopes=["public"])],
     limit: Annotated[int, Query(ge=1, le=1000, description="返回条数 (1-1000)")] = 100,
     offset: Annotated[int, Query(ge=0, description="偏移量")] = 0,
 ):
@@ -440,8 +419,8 @@ async def get_user_beatmapsets(
         return cached_result
 
     user = await session.get(User, user_id)
-    if not user or user.id == BANCHOBOT_ID or not await visible_to_current_user(user, current_user, session):
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+    if not user or user.id == BANCHOBOT_ID:
+        raise HTTPException(404, detail="User not found")
 
     if type in {
         BeatmapsetType.GRAVEYARD,
@@ -455,28 +434,10 @@ async def get_user_beatmapsets(
         resp = []
 
     elif type == BeatmapsetType.FAVOURITE:
-        if offset == 0:
-            cursor = sys.maxsize
-        else:
-            cursor = (
-                await session.exec(
-                    select(FavouriteBeatmapset.id)
-                    .where(FavouriteBeatmapset.user_id == user_id)
-                    .order_by(col(FavouriteBeatmapset.id).desc())
-                    .limit(1)
-                    .offset(offset - 1)
-                )
-            ).first()
-        if cursor is None:
-            return []
-        favourites = (
-            await session.exec(
-                select(FavouriteBeatmapset)
-                .where(FavouriteBeatmapset.user_id == user_id, FavouriteBeatmapset.id < cursor)
-                .order_by(col(FavouriteBeatmapset.id).desc())
-                .limit(limit)
-            )
-        ).all()
+        user = await session.get(User, user_id)
+        if user is None or not await visible_to_current_user(user, current_user, session):
+            raise HTTPException(404, detail="User not found")
+        favourites = await user.awaitable_attrs.favourite_beatmapsets
         resp = [
             await BeatmapsetModel.transform(
                 favourite.beatmapset, session=session, user=user, includes=beatmapset_includes
@@ -485,36 +446,23 @@ async def get_user_beatmapsets(
         ]
 
     elif type == BeatmapsetType.MOST_PLAYED:
-        if offset == 0:
-            cursor = sys.maxsize, sys.maxsize
-        else:
-            cursor = (
-                await session.exec(
-                    select(BeatmapPlaycounts.playcount, BeatmapPlaycounts.id)
-                    .where(BeatmapPlaycounts.user_id == user_id)
-                    .order_by(col(BeatmapPlaycounts.playcount).desc(), col(BeatmapPlaycounts.id).desc())
-                    .limit(1)
-                    .offset(offset - 1)
-                )
-            ).first()
-        if cursor is None:
-            return []
-        cursor_pc, cursor_id = cursor
+        user = await session.get(User, user_id)
+        if user is None or not await visible_to_current_user(user, current_user, session):
+            raise HTTPException(404, detail="User not found")
+
         most_played = await session.exec(
             select(BeatmapPlaycounts)
-            .where(
-                BeatmapPlaycounts.user_id == user_id,
-                tuple_(BeatmapPlaycounts.playcount, BeatmapPlaycounts.id) < tuple_(cursor_pc, cursor_id),
-            )
-            .order_by(col(BeatmapPlaycounts.playcount).desc(), col(BeatmapPlaycounts.id).desc())
+            .where(BeatmapPlaycounts.user_id == user_id)
+            .order_by(col(BeatmapPlaycounts.playcount).desc())
             .limit(limit)
+            .offset(offset)
         )
         resp = [
             await BeatmapPlaycountsModel.transform(most_played_beatmap, user=user, includes=beatmapset_includes)
             for most_played_beatmap in most_played
         ]
     else:
-        raise RequestError(ErrorType.INVALID_BEATMAPSET_TYPE)
+        raise HTTPException(400, detail="Invalid beatmapset type")
 
     # 异步缓存结果
     async def cache_beatmapsets():
@@ -540,6 +488,7 @@ async def get_user_beatmapsets(
 )
 @asset_proxy_response
 async def get_user_scores(
+    request: Request,
     session: Database,
     api_version: APIVersion,
     background_task: BackgroundTasks,
@@ -569,96 +518,35 @@ async def get_user_scores(
 
     db_user = await session.get(User, user_id)
     if db_user is None or not await visible_to_current_user(db_user, current_user, session):
-        raise RequestError(ErrorType.USER_NOT_FOUND)
+        raise HTTPException(404, detail="User not found")
 
     gamemode = mode or db_user.playmode
+    order_by = None
     where_clause = (col(Score.user_id) == db_user.id) & (col(Score.gamemode) == gamemode)
     includes = Score.USER_PROFILE_INCLUDES.copy()
     if not include_fails:
         where_clause &= col(Score.passed).is_(True)
-
-    scores = []
     if type == "pinned":
         where_clause &= Score.pinned_order > 0
-        if offset == 0:
-            cursor = 0, sys.maxsize
-        else:
-            cursor = (
-                await session.exec(
-                    select(Score.pinned_order, Score.id)
-                    .where(where_clause)
-                    .order_by(col(Score.pinned_order).asc(), col(Score.id).desc())
-                    .limit(1)
-                    .offset(offset - 1)
-                )
-            ).first()
-        if cursor:
-            cursor_pinned, cursor_id = cursor
-            where_clause &= (col(Score.pinned_order) > cursor_pinned) | (
-                (col(Score.pinned_order) == cursor_pinned) & (col(Score.id) < cursor_id)
-            )
-            scores = (
-                await session.exec(
-                    select(Score)
-                    .where(where_clause)
-                    .order_by(col(Score.pinned_order).asc(), col(Score.id).desc())
-                    .limit(limit)
-                )
-            ).all()
-
+        order_by = col(Score.pinned_order).asc()
     elif type == "best":
         where_clause &= exists().where(col(BestScore.score_id) == Score.id)
+        order_by = col(Score.pp).desc()
         includes.append("weight")
-
-        if offset == 0:
-            cursor = sys.maxsize, sys.maxsize
-        else:
-            cursor = (
-                await session.exec(
-                    select(Score.pp, Score.id)
-                    .where(where_clause)
-                    .order_by(col(Score.pp).desc(), col(Score.id).desc())
-                    .limit(1)
-                    .offset(offset - 1)
-                )
-            ).first()
-        if cursor:
-            cursor_pp, cursor_id = cursor
-            where_clause &= tuple_(col(Score.pp), col(Score.id)) < tuple_(cursor_pp, cursor_id)
-            scores = (
-                await session.exec(
-                    select(Score).where(where_clause).order_by(col(Score.pp).desc(), col(Score.id).desc()).limit(limit)
-                )
-            ).all()
-
     elif type == "recent":
         where_clause &= Score.ended_at > utcnow() - timedelta(hours=24)
-        if offset == 0:
-            cursor = datetime.max, sys.maxsize
-        else:
-            cursor = (
-                await session.exec(
-                    select(Score.ended_at, Score.id)
-                    .where(where_clause)
-                    .order_by(col(Score.ended_at).desc(), col(Score.id).desc())
-                    .limit(1)
-                    .offset(offset - 1)
-                )
-            ).first()
-        if cursor:
-            cursor_date, cursor_id = cursor
-            where_clause &= tuple_(col(Score.ended_at), col(Score.id)) < tuple_(cursor_date, cursor_id)
-            scores = (
-                await session.exec(
-                    select(Score)
-                    .where(where_clause)
-                    .order_by(col(Score.ended_at).desc(), col(Score.id).desc())
-                    .limit(limit)
-                )
-            ).all()
-
+        order_by = col(Score.ended_at).desc()
     elif type == "firsts":
-        best_scores = await get_user_first_scores(session, db_user.id, gamemode, limit, offset)
+        where_clause &= false()
+
+    if type != "firsts":
+        scores = (
+            await session.exec(select(Score).where(where_clause).order_by(order_by).limit(limit).offset(offset))
+        ).all()
+        if not scores:
+            return []
+    else:
+        best_scores = await get_user_first_scores(session, db_user.id, gamemode, limit)
         scores = [best_score.score for best_score in best_scores]
 
     score_responses = [
