@@ -6,6 +6,7 @@ from app.database.beatmap import (
     BeatmapModel,
 )
 from app.database.beatmapset import BeatmapsetModel
+from app.database.chat import ChannelType, ChatChannel, ChatMessage, MessageType
 from app.database.item_attempts_count import ItemAttemptsCount, ItemAttemptsCountModel
 from app.database.multiplayer_event import MultiplayerEvent, MultiplayerEventResp
 from app.database.playlists import Playlist, PlaylistModel
@@ -15,14 +16,16 @@ from app.database.score import Score
 from app.database.user import User, UserModel
 from app.dependencies.database import Database, Redis
 from app.dependencies.user import ClientUser, get_current_user
-from app.models.error import ErrorType, RequestError
+from app.models.notification import ChannelMessage
 from app.models.room import MatchType, RoomCategory, RoomStatus
+from app.router.notification.server import server
+from app.service.redis_message_system import redis_message_system
 from app.service.room import create_playlist_room_from_api
 from app.utils import api_doc, utcnow
 
 from .router import router
 
-from fastapi import Path, Query, Security
+from fastapi import HTTPException, Path, Query, Security
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import col, exists, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -71,13 +74,18 @@ async def get_all_rooms(
     if status is not None:
         where_clauses.append(col(Room.status) == status)
     if mode == "open":
-        where_clauses.extend(
-            [
-                col(Room.status).in_([RoomStatus.IDLE, RoomStatus.PLAYING]),
-                col(Room.starts_at).is_not(None),
-                col(Room.ends_at).is_(None) if category == RoomCategory.REALTIME else col(Room.ends_at) > now,
-            ]
-        )
+        open_clauses = [
+            col(Room.status).in_([RoomStatus.IDLE, RoomStatus.PLAYING]),
+            col(Room.starts_at).is_not(None),
+        ]
+
+        if category == RoomCategory.REALTIME:
+            open_clauses.append(col(Room.ends_at).is_(None))
+        else:
+            # For NORMAL and DAILY_CHALLENGE, ensure room has not ended
+            open_clauses.append(col(Room.ends_at) > now)
+
+        where_clauses.extend(open_clauses)
 
     if mode == "participated":
         where_clauses.append(
@@ -167,7 +175,7 @@ async def create_room(
     redis: Redis,
 ):
     if await current_user.is_restricted(db):
-        raise RequestError(ErrorType.ACCOUNT_RESTRICTED)
+        raise HTTPException(status_code=403, detail="Your account is restricted from multiplayer.")
     user_id = current_user.id
     db_room = await create_playlist_room_from_api(db, room, user_id)
     await _participate_room(db_room.id, user_id, db_room, db, redis)
@@ -203,7 +211,7 @@ async def get_room(
 ):
     db_room = (await db.exec(select(Room).where(Room.id == room_id))).first()
     if db_room is None:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(404, "Room not found")
     resp = await RoomModel.transform(db_room, includes=Room.SHOW_RESPONSE_INCLUDES, user=current_user)
     return resp
 
@@ -220,11 +228,11 @@ async def delete_room(
     current_user: ClientUser,
 ):
     if await current_user.is_restricted(db):
-        raise RequestError(ErrorType.ACCOUNT_RESTRICTED)
+        raise HTTPException(status_code=403, detail="Your account is restricted from multiplayer.")
 
     db_room = (await db.exec(select(Room).where(Room.id == room_id))).first()
     if db_room is None:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(404, "Room not found")
     else:
         db_room.ends_at = utcnow()
         await db.commit()
@@ -245,7 +253,7 @@ async def add_user_to_room(
     current_user: ClientUser,
 ):
     if await current_user.is_restricted(db):
-        raise RequestError(ErrorType.ACCOUNT_RESTRICTED)
+        raise HTTPException(status_code=403, detail="Your account is restricted from multiplayer.")
 
     db_room = (await db.exec(select(Room).where(Room.id == room_id))).first()
     if db_room is not None:
@@ -255,7 +263,7 @@ async def add_user_to_room(
         resp = await RoomModel.transform(db_room, includes=Room.SHOW_RESPONSE_INCLUDES)
         return resp
     else:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(404, "room not found")
 
 
 @router.delete(
@@ -272,7 +280,7 @@ async def remove_user_from_room(
     redis: Redis,
 ):
     if await current_user.is_restricted(db):
-        raise RequestError(ErrorType.ACCOUNT_RESTRICTED)
+        raise HTTPException(status_code=403, detail="Your account is restricted from multiplayer.")
 
     db_room = (await db.exec(select(Room).where(Room.id == room_id))).first()
     if db_room is not None:
@@ -292,7 +300,7 @@ async def remove_user_from_room(
         await db.commit()
         return None
     else:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(404, "Room not found")
 
 
 @router.get(
@@ -319,7 +327,7 @@ async def get_room_leaderboard(
 ):
     db_room = (await db.exec(select(Room).where(Room.id == room_id))).first()
     if db_room is None:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(404, "Room not found")
     aggs = await db.exec(
         select(ItemAttemptsCount)
         .where(ItemAttemptsCount.room_id == room_id)
@@ -427,7 +435,7 @@ async def get_room_events(
 
     room = (await db.exec(select(Room).where(Room.id == room_id))).first()
     if room is None:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(404, "Room not found")
     room_resp = await RoomModel.transform(room, includes=["current_playlist_item"])
     if room.category == RoomCategory.REALTIME:
         current_playlist_item_id = (await Room.current_playlist_item(db, room))["id"]
@@ -444,9 +452,13 @@ async def get_room_events(
     ]
 
     beatmapsets = []
+    beatmapset_ids = set()
     for beatmap in beatmaps:
-        if beatmap.beatmapset_id not in beatmapsets:
-            beatmapsets.append(beatmap.beatmapset)
+        if beatmap and beatmap.beatmapset_id not in beatmapset_ids:
+            beatmapset_ids.add(beatmap.beatmapset_id)
+            beatmapset = await beatmap.awaitable_attrs.beatmapset
+            if beatmapset:
+                beatmapsets.append(beatmapset)
     beatmapset_resps = [
         await BeatmapsetModel.transform(
             beatmapset,
@@ -469,3 +481,76 @@ async def get_room_events(
         "room": room_resp,
         "user": user_resps,
     }
+
+@router.post(
+    "/rooms/{room_id}/invite/{user_id}",
+    tags=["房间"],
+    name="邀请用户加入房间",
+    description="邀请指定用户加入多人游戏房间，发送聊天消息和实时通知",
+)
+async def invite_user_to_room(
+    db: Database,
+    room_id: Annotated[int, Path(..., description="房间 ID")],
+    user_id: Annotated[int, Path(..., description="被邀请用户 ID")],
+    current_user: ClientUser,
+    redis: Redis,
+):
+    # Validate room exists and user is host
+    db_room = (await db.exec(select(Room).where(Room.id == room_id))).first()
+    if db_room is None:
+        raise HTTPException(404, "Room not found")
+
+    if db_room.host_id != current_user.id:
+        raise HTTPException(403, "Only room host can invite players")
+
+    # Check if target user exists and can receive invites
+    target_user = await db.get(User, user_id)
+    if target_user is None or await target_user.is_restricted(db):
+        raise HTTPException(404, "Target user not found or restricted")
+
+    # Create PM channel for invite message
+    channel = await ChatChannel.get_pm_channel(current_user.id, user_id, db)
+    if channel is None:
+        channel = ChatChannel(
+            name=f"pm_{current_user.id}_{user_id}",
+            description="Private message channel",
+            type=ChannelType.PM,
+        )
+        db.add(channel)
+        await db.commit()
+        await db.refresh(channel)
+
+    # Create invite chat message with proper formatting using Redis message system
+    invite_content = f'Come join my multiplayer game "{db_room.name}": osu://room/{room_id}'
+
+    # Use Redis message system to send the chat message (this creates the message AND broadcasts it)
+    resp = await redis_message_system.send_message(
+        channel_id=channel.channel_id,
+        user=current_user,
+        content=invite_content,
+        is_action=False,
+        user_uuid=None,
+    )
+
+    # Broadcast the message to the channel participants (this will show RedisMessageSystem logs)
+    await server.send_message_to_channel(resp)
+
+    # Send notification for PM channels
+    temp_msg = ChatMessage(
+        message_id=resp["message_id"],
+        channel_id=channel.channel_id,
+        content=invite_content,
+        sender_id=current_user.id,
+        type=MessageType.PLAIN,
+    )
+    user_ids = channel.name.split("_")[1:]
+    await server.new_private_notification(
+        ChannelMessage.init(temp_msg, current_user, [int(u) for u in user_ids], channel.type)
+    )
+
+    # TODO: Send invite to spectator server for real-time multiplayer notification
+    # This would typically involve calling the spectator server's InvitePlayer method
+    # through an internal API or message queue system
+
+    # Return the chat message
+    return resp
