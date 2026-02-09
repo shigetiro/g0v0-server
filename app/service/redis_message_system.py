@@ -107,17 +107,39 @@ class RedisMessageSystem:
                         user_resp = await UserModel.transform(sender, includes=User.LIST_INCLUDES)
 
                         from app.database.chat import ChatMessageDict
+                        
+                        ts_raw = msg_data.get("timestamp")
+                        if isinstance(ts_raw, str):
+                            if ts_raw.endswith("Z"):
+                                ts_parsed = datetime.fromisoformat(ts_raw[:-1] + "+00:00")
+                            else:
+                                ts_parsed = datetime.fromisoformat(ts_raw)
+                        elif isinstance(ts_raw, datetime):
+                            ts_parsed = ts_raw
+                        else:
+                            # assume seconds epoch if integer-like, else fallback
+                            try:
+                                ts_parsed = datetime.fromtimestamp(int(ts_raw))
+                            except Exception:
+                                ts_parsed = datetime.now()
+
+                        type_raw = msg_data.get("type")
+                        is_action = bool(msg_data.get("is_action")) or str(type_raw or "") == MessageType.ACTION.value
+                        try:
+                            type_enum = MessageType(type_raw) if isinstance(type_raw, str) else (MessageType.ACTION if is_action else MessageType.PLAIN)
+                        except Exception:
+                            type_enum = MessageType.ACTION if is_action else MessageType.PLAIN
 
                         message_resp: ChatMessageDict = {
                             "message_id": msg_data["message_id"],
                             "channel_id": msg_data["channel_id"],
-                            "content": msg_data["content"],
-                            "timestamp": datetime.fromisoformat(msg_data["timestamp"]),  # pyright: ignore[reportArgumentType]
+                            "content": msg_data.get("content", ""),
+                            "timestamp": ts_parsed,
                             "sender_id": msg_data["sender_id"],
                             "sender": user_resp,
-                            "is_action": msg_data["type"] == MessageType.ACTION.value,
+                            "is_action": is_action,
                             "uuid": msg_data.get("uuid") or None,
-                            "type": MessageType(msg_data["type"]),
+                            "type": type_enum,
                         }
                         messages.append(message_resp)
 
@@ -184,11 +206,18 @@ class RedisMessageSystem:
     async def _get_from_redis(self, channel_id: int, limit: int = 50, since: int = 0) -> list[ChatMessageDict]:
         """从 Redis 获取消息"""
         try:
+            channel_messages_key = f"channel:{channel_id}:messages"
+            try:
+                key_type = await self.redis.type(channel_messages_key)
+                if key_type not in ("none", "zset"):
+                    await self.redis.delete(channel_messages_key)
+            except Exception:
+                await self.redis.delete(channel_messages_key)
             # 获取消息键列表，按消息ID排序
             if since > 0:
                 # 获取指定ID之后的消息（正序）
                 message_keys = await self.redis.zrangebyscore(
-                    f"channel:{channel_id}:messages",
+                    channel_messages_key,
                     since + 1,
                     "+inf",
                     start=0,
@@ -196,11 +225,22 @@ class RedisMessageSystem:
                 )
             else:
                 # 获取最新的消息（倒序获取，然后反转）
-                message_keys = await self.redis.zrevrange(f"channel:{channel_id}:messages", 0, limit - 1)
+                message_keys = await self.redis.zrevrange(channel_messages_key, 0, limit - 1)
 
             messages = []
             for key in message_keys:
-                # 获取消息数据（JSON 字符串）
+                try:
+                    key_type = await self.redis.type(key)
+                    if key_type not in ("none", "string"):
+                        logger.warning(f"Removing wrong-type Redis key {key}: {key_type}")
+                        await self.redis.zrem(channel_messages_key, key)
+                        await self.redis.delete(key)
+                        continue
+                except Exception as type_err:
+                    logger.warning(f"Failed to check type for {key}: {type_err}")
+                    await self.redis.zrem(channel_messages_key, key)
+                    continue
+                
                 raw_data = await self.redis.get(key)
                 if raw_data:
                     try:
@@ -413,6 +453,12 @@ class RedisMessageSystem:
             # 扫描所有 channel:*:messages 键并检查类型
             keys_pattern = "channel:*:messages"
             keys = await self.redis.keys(keys_pattern)
+            keys = await self.redis.keys("msg:*:*")
+            for key in keys:
+                t = await self.redis.type(key)
+                if t not in ("none", "string"):
+                    logger.warning(f"Cleaning wrong-type message key {key}: {t}")
+                    await self.redis.delete(key)            
 
             fixed_count = 0
             for key in keys:
