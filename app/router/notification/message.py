@@ -1,4 +1,5 @@
 from typing import Annotated
+import re
 
 from app.database import ChatChannelModel
 from app.database.chat import (
@@ -15,7 +16,6 @@ from app.dependencies.database import Database, Redis, redis_message_client
 from app.dependencies.param import BodyOrForm
 from app.dependencies.user import get_current_user
 from app.log import log
-from app.models.error import ErrorType, RequestError
 from app.models.notification import ChannelMessage, ChannelMessageTeam
 from app.router.v2 import api_v2_router as router
 from app.service.redis_message_system import redis_message_system
@@ -24,7 +24,7 @@ from app.utils import api_doc
 from .banchobot import bot
 from .server import server
 
-from fastapi import Depends, Path, Query, Security
+from fastapi import Depends, HTTPException, Path, Query, Security
 from pydantic import BaseModel, Field
 from sqlmodel import col, select
 
@@ -82,21 +82,21 @@ async def send_message(
     current_user: Annotated[User, Security(get_current_user, scopes=["chat.write"])],
 ):
     if await current_user.is_restricted(session):
-        raise RequestError(ErrorType.MESSAGING_RESTRICTED)
+        raise HTTPException(status_code=403, detail="You are restricted from sending messages")
 
     # 使用明确的查询来获取 channel，避免延迟加载
     if channel.isdigit():
         db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == int(channel)))).first()
     else:
-        db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_name == channel))).first()
+        db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.name == channel))).first()
 
     if db_channel is None:
-        raise RequestError(ErrorType.CHANNEL_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Channel not found")
 
     # 立即提取所有需要的属性，避免后续延迟加载
     channel_id = db_channel.channel_id
     channel_type = db_channel.type
-    channel_name = db_channel.channel_name
+    channel_name = db_channel.name
     user_id = current_user.id
 
     # 对于多人游戏房间，在发送消息前进行Redis键检查
@@ -129,6 +129,47 @@ async def send_message(
         await bot.try_handle(current_user, db_channel, req.message, session)
 
     await session.refresh(current_user)
+
+    # Process mentions for Public/Multiplayer channels
+    if channel_type not in [ChannelType.PM, ChannelType.TEAM]:
+        user_ids = server.channels.get(channel_id, [])
+        if user_ids:
+            # Filter sender
+            target_ids = [uid for uid in user_ids if uid != user_id]
+
+            mentioned_users = []
+            if target_ids:
+                if len(target_ids) < 100:
+                    # Small channel: check all usernames
+                    users = (await session.exec(select(User).where(col(User.id).in_(target_ids)))).all()
+                    for user in users:
+                        # Simple case-insensitive check
+                        # Note: This might match partial words (e.g. "cat" in "category")
+                        # For better accuracy, we'd need word boundary checks, but usernames can be complex.
+                        if user.username.lower() in req.message.lower():
+                            mentioned_users.append(user)
+                else:
+                    # Large channel: check @mentions
+                    mentions = re.findall(r"@(\S+)", req.message)
+                    if mentions:
+                        cleaned_mentions = [m.strip(".,!?:") for m in mentions]
+                        users = (await session.exec(select(User).where(col(User.username).in_(cleaned_mentions)))).all()
+                        mentioned_users = [u for u in users if u.id in target_ids]
+
+            if mentioned_users:
+                 temp_msg = ChatMessage(
+                    message_id=resp["message_id"],
+                    channel_id=channel_id,
+                    content=req.message,
+                    sender_id=user_id,
+                    type=MessageType.ACTION if req.is_action else MessageType.PLAIN,
+                    uuid=req.uuid,
+                )
+                 for user in mentioned_users:
+                     await server.new_private_notification(
+                        ChannelMessage.init(temp_msg, current_user, [user.id], channel_type)
+                     )
+
     # 为通知系统创建临时 ChatMessage 对象（仅适用于私聊和团队频道）
     if channel_type in [ChannelType.PM, ChannelType.TEAM]:
         temp_msg = ChatMessage(
@@ -170,10 +211,10 @@ async def get_message(
     if channel.isdigit():
         db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == int(channel)))).first()
     else:
-        db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_name == channel))).first()
+        db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.name == channel))).first()
 
     if db_channel is None:
-        raise RequestError(ErrorType.CHANNEL_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Channel not found")
 
     channel_id = db_channel.channel_id
 
@@ -232,10 +273,10 @@ async def mark_as_read(
     if channel.isdigit():
         db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == int(channel)))).first()
     else:
-        db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_name == channel))).first()
+        db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.name == channel))).first()
 
     if db_channel is None:
-        raise RequestError(ErrorType.CHANNEL_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Channel not found")
 
     # 立即提取需要的属性
     channel_id = db_channel.channel_id
@@ -274,15 +315,15 @@ async def create_new_pm(
     redis: Redis,
 ):
     if await current_user.is_restricted(session):
-        raise RequestError(ErrorType.MESSAGING_RESTRICTED)
+        raise HTTPException(status_code=403, detail="You are restricted from sending messages")
 
     user_id = current_user.id
     target = await session.get(User, req.target_id)
     if target is None or await target.is_restricted(session):
-        raise RequestError(ErrorType.TARGET_USER_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Target user not found")
     is_can_pm, block = await target.is_user_can_pm(current_user, session)
     if not is_can_pm:
-        raise RequestError(ErrorType.MESSAGING_RESTRICTED, {"reason": block})
+        raise HTTPException(status_code=403, detail=block)
 
     channel = await ChatChannel.get_pm_channel(user_id, req.target_id, session)
     if channel is None:
