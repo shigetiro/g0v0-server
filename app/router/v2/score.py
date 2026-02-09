@@ -1,4 +1,5 @@
 from datetime import UTC, date
+import json
 import time
 from typing import Annotated
 
@@ -7,6 +8,8 @@ from app.config import settings
 from app.database import (
     Beatmap,
     Playlist,
+    RhythiaBeatmap,
+    RhythiaScore,
     Room,
     Score,
     ScoreToken,
@@ -14,12 +17,12 @@ from app.database import (
     User,
 )
 from app.database.achievement import process_achievements
+from app.database.chat import ChatChannel
 from app.database.counts import ReplayWatchedCount
 from app.database.daily_challenge import process_daily_challenge_score
 from app.database.item_attempts_count import ItemAttemptsCount
 from app.database.playlist_best_score import (
     PlaylistBestScore,
-    get_position,
     process_playlist_best_score,
 )
 from app.database.relationship import Relationship, RelationshipType
@@ -35,14 +38,12 @@ from app.database.score import (
 )
 from app.dependencies.api_version import APIVersion
 from app.dependencies.cache import UserCacheService
-from app.dependencies.client_verification import ClientVerificationService
 from app.dependencies.database import Database, Redis, get_redis, with_db
 from app.dependencies.fetcher import Fetcher, get_fetcher
 from app.dependencies.storage import StorageService
 from app.dependencies.user import ClientUser, get_current_user
 from app.log import log
 from app.models.beatmap import BeatmapRankStatus
-from app.models.error import ErrorType, RequestError
 from app.models.room import RoomCategory
 from app.models.score import (
     GameMode,
@@ -50,6 +51,7 @@ from app.models.score import (
     Rank,
     SoloScoreSubmissionInfo,
 )
+from app.router.notification.banchobot import bot
 from app.service.beatmap_cache_service import get_beatmap_cache_service
 from app.service.user_cache_service import refresh_user_cache_background
 from app.utils import api_doc, utcnow
@@ -61,6 +63,7 @@ from fastapi import (
     Body,
     Depends,
     Form,
+    HTTPException,
     Path,
     Query,
     Security,
@@ -118,17 +121,60 @@ async def _process_user(score_id: int, user_id: int, redis: Redis, fetcher: Fetc
                 score_id=score_id,
             )
             return
+        beatmap_id = score.beatmap_id
+        gamemode = score.gamemode
+        username = user.username
+
         await process_user(session, redis, fetcher, user, score, score_token, beatmap[0], BeatmapRankStatus(beatmap[1]))
+
+        position = await get_score_position_by_id(
+            session,
+            beatmap_id,
+            score_id,
+            mode=gamemode,
+        )
+
+        if position == 1:
+            full_beatmap = (
+                await session.exec(
+                    select(Beatmap)
+                    .where(Beatmap.id == beatmap_id)
+                    .options(joinedload(Beatmap.beatmapset))  # pyright: ignore[reportArgumentType]
+                )
+            ).first()
+
+            if full_beatmap and full_beatmap.beatmapset:
+                announce_channel = (
+                    await session.exec(select(ChatChannel).where(ChatChannel.name == "announce"))
+                ).first()
+                if announce_channel:
+                    title = full_beatmap.beatmapset.title
+                    artist = full_beatmap.beatmapset.artist
+                    difficulty = full_beatmap.version
+                    processed_score = await session.get(Score, score_id)
+                    pp_value = processed_score.pp if processed_score else None
+                    pp_str = f"{pp_value:.2f}" if pp_value is not None else "0"
+
+                    beatmap_url = settings.web_url + f"b/{beatmap_id}"
+                    map_text = f"{artist} - {title} [{difficulty}]"
+                    msg = (
+                        f"{username} achieved #1 on [{beatmap_url} {map_text}] on {gamemode} and got"
+                        f" {pp_str}PP"
+                    )
+                    await bot._send_message(announce_channel, msg, session)
 
 
 async def submit_score(
     background_task: BackgroundTasks,
     info: SoloScoreSubmissionInfo,
+    beatmap: int,
     token: int,
     current_user: User,
     db: AsyncSession,
     redis: Redis,
     fetcher: Fetcher,
+    item_id: int | None = None,
+    room_id: int | None = None,
 ):
     # 立即获取用户ID，避免后续的懒加载问题
     user_id = current_user.id
@@ -139,7 +185,7 @@ async def submit_score(
         await db.exec(select(ScoreToken).options(joinedload(ScoreToken.beatmap)).where(ScoreToken.id == token))
     ).first()
     if not score_token or score_token.user_id != user_id:
-        raise RequestError(ErrorType.SCORE_TOKEN_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Score token not found")
     if score_token.score_id:
         score = (
             await db.exec(
@@ -150,9 +196,8 @@ async def submit_score(
             )
         ).first()
         if not score:
-            raise RequestError(ErrorType.SCORE_NOT_FOUND)
+            raise HTTPException(status_code=404, detail="Score not found")
     else:
-        beatmap = score_token.beatmap_id
         try:
             cache_service = get_beatmap_cache_service(redis, fetcher)
             await cache_service.smart_preload_for_score(beatmap)
@@ -162,7 +207,7 @@ async def submit_score(
         try:
             db_beatmap = await Beatmap.get_or_fetch(db, fetcher, bid=beatmap)
         except HTTPError:
-            raise RequestError(ErrorType.BEATMAP_NOT_FOUND)
+            raise HTTPException(status_code=404, detail="Beatmap not found")
         status = db_beatmap.beatmap_status
         score = await process_score(
             current_user,
@@ -171,6 +216,8 @@ async def submit_score(
             score_token,
             info,
             db,
+            item_id,
+            room_id,
         )
         await db.refresh(score_token)
         score_id = score.id
@@ -266,38 +313,136 @@ async def get_beatmap_scores(
     ] = LeaderboardType.GLOBAL,
     limit: Annotated[int, Query(ge=1, le=200, description="返回条数 (1-200)")] = 50,
 ):
-    all_scores, user_score, count = await get_leaderboard(
-        db,
-        beatmap_id,
-        mode,
-        type=type,
-        user=current_user,
-        limit=limit,
-        mods=sorted(mods),
-    )
+    # Check if this is a Rhythia beatmap
+    from sqlmodel import select
+    rhythia_beatmap = (await db.exec(select(RhythiaBeatmap).where(RhythiaBeatmap.id == beatmap_id))).first()
 
-    user_score_resp = await user_score.to_resp(db, api_version, includes=DEFAULT_SCORE_INCLUDES) if user_score else None
-    return {
-        "scores": [await score.to_resp(db, api_version, includes=DEFAULT_SCORE_INCLUDES) for score in all_scores],
-        "user_score": (
-            {
-                "score": user_score_resp,
-                "position": (
-                    await get_score_position_by_id(
-                        db,
-                        user_score.beatmap_id,
-                        user_score.id,
-                        mode=user_score.gamemode,
-                        user=user_score.user,
-                    )
-                    or 0
-                ),
-            }
-            if user_score and user_score_resp
-            else None
-        ),
-        "score_count": count,
-    }
+    if rhythia_beatmap:
+        # Handle Rhythia beatmap scores
+        scores_query = (
+            select(RhythiaScore)
+            .where(
+                RhythiaScore.beatmap_id == beatmap_id,
+                RhythiaScore.mode_int == int(mode),
+            )
+            .order_by(RhythiaScore.score.desc())
+            .limit(limit)
+        )
+
+        if mods:
+            scores_query = scores_query.where(RhythiaScore.mods == mods)
+
+        scores = (await db.exec(scores_query)).all()
+
+        # Get user's score for this Rhythia beatmap
+        user_score_query = (
+            select(RhythiaScore)
+            .where(
+                RhythiaScore.beatmap_id == beatmap_id,
+                RhythiaScore.user_id == current_user.id,
+                RhythiaScore.mode_int == int(mode),
+            )
+            .order_by(RhythiaScore.score.desc())
+            .limit(1)
+        )
+
+        if mods:
+            user_score_query = user_score_query.where(RhythiaScore.mods == mods)
+
+        user_score = (await db.exec(user_score_query)).first()
+
+        # Convert Rhythia scores to compatible format
+        score_count = len(scores)
+
+        return {
+            "scores": [
+                {
+                    "id": score.id,
+                    "best_id": score.id,
+                    "user_id": score.user_id,
+                    "accuracy": score.accuracy,
+                    "total_score": score.score,
+                    "max_combo": score.max_combo,
+                    "passed": True,  # Rhythia scores are always passed
+                    "perfect": score.rank == "X" or score.rank == "SS",
+                    "statistics": score.statistics,
+                    "user": {
+                        "id": score.user_id,
+                        "username": current_user.username,  # This should be fetched properly
+                        "country_code": current_user.country_code,
+                    },
+                    "created_at": score.created_at,
+                    "mode": score.mode,
+                    "mods": score.mods,
+                    "rank": score.rank,
+                    "pp": score.pp,
+                }
+                for score in scores
+            ],
+            "user_score": (
+                {
+                    "score": {
+                        "id": user_score.id,
+                        "best_id": user_score.id,
+                        "user_id": user_score.user_id,
+                        "accuracy": user_score.accuracy,
+                        "total_score": user_score.score,
+                        "max_combo": user_score.max_combo,
+                        "passed": True,
+                        "perfect": user_score.rank == "X" or user_score.rank == "SS",
+                        "statistics": user_score.statistics,
+                        "user": {
+                            "id": user_score.user_id,
+                            "username": current_user.username,
+                            "country_code": current_user.country_code,
+                        },
+                        "created_at": user_score.created_at,
+                        "mode": user_score.mode,
+                        "mods": user_score.mods,
+                        "rank": user_score.rank,
+                        "pp": user_score.pp,
+                    },
+                    "position": 1,  # This should be calculated properly
+                }
+                if user_score
+                else None
+            ),
+            "score_count": score_count,
+        }
+    else:
+        # Handle regular beatmap scores (existing logic)
+        all_scores, user_score, count = await get_leaderboard(
+            db,
+            beatmap_id,
+            mode,
+            type=type,
+            user=current_user,
+            limit=limit,
+            mods=sorted(mods),
+        )
+
+        user_score_resp = await user_score.to_resp(db, api_version, includes=DEFAULT_SCORE_INCLUDES) if user_score else None
+        return {
+            "scores": [await score.to_resp(db, api_version, includes=DEFAULT_SCORE_INCLUDES) for score in all_scores],
+            "user_score": (
+                {
+                    "score": user_score_resp,
+                    "position": (
+                        await get_score_position_by_id(
+                            db,
+                            user_score.beatmap_id,
+                            user_score.id,
+                            mode=user_score.gamemode,
+                            user=user_score.user,
+                        )
+                        or 0
+                    ),
+                }
+                if user_score and user_score_resp
+                else None
+            ),
+            "score_count": count,
+        }
 
 
 @router.get(
@@ -342,9 +487,9 @@ async def get_user_beatmap_score(
     ).first()
 
     if not user_score:
-        raise RequestError(
-            ErrorType.SCORE_NOT_FOUND,
-            {"user_id": user_id, "beatmap_id": beatmap_id},
+        raise HTTPException(
+            status_code=404,
+            detail=f"Cannot find user {user_id}'s score on this beatmap",
         )
     else:
         resp = await user_score.to_resp(db, api_version=api_version, includes=DEFAULT_SCORE_INCLUDES)
@@ -416,8 +561,6 @@ async def get_user_all_beatmap_scores(
 async def create_solo_score(
     background_task: BackgroundTasks,
     db: Database,
-    fetcher: Fetcher,
-    verification_service: ClientVerificationService,
     beatmap_id: Annotated[int, Path(description="谱面 ID")],
     beatmap_hash: Annotated[str, Form(description="谱面文件哈希")],
     ruleset_id: Annotated[int, Form(..., description="ruleset 数字 ID (0-3)")],
@@ -431,37 +574,17 @@ async def create_solo_score(
     try:
         gamemode = GameMode.from_int(ruleset_id)
     except ValueError:
-        raise RequestError(ErrorType.INVALID_RULESET_ID)
+        raise HTTPException(status_code=400, detail="Invalid ruleset ID")
 
-    if not (
-        client_version := await verification_service.validate_client_version(
-            version_hash,
-        )
-    ):
-        logger.info(
-            f"Client version check failed for user {current_user.id} on beatmap {beatmap_id} "
-            f"(version hash: {version_hash})"
-        )
-        raise RequestError(ErrorType.INVALID_CLIENT_HASH)
-
-    beatmap = await Beatmap.get_or_fetch(db, fetcher, md5=beatmap_hash)
-    if not beatmap or beatmap.id != beatmap_id:
-        raise RequestError(ErrorType.INVALID_OR_MISSING_BEATMAP_HASH)
-
-    result = gamemode.check_ruleset_version(ruleset_hash)
-    if not result:
+    if not (result := gamemode.check_ruleset_version(ruleset_hash)):
         logger.info(
             f"Ruleset version check failed for user {current_user.id} on beatmap {beatmap_id} "
             f"(ruleset: {ruleset_id}, hash: {ruleset_hash})"
         )
-
-        details = {"ruleset_id": ruleset_id, "ruleset_hash": ruleset_hash}
-
-        # The result may have useful information in its own message
-        if result.error_msg:
-            details.update({"error": result.error_msg})
-
-        raise RequestError(ErrorType.RULESET_VERSION_CHECK_FAILED, details)
+        raise HTTPException(
+            status_code=422,
+            detail=result.error_msg or "Ruleset version check failed",
+        )
 
     background_task.add_task(_preload_beatmap_for_pp_calculation, beatmap_id)
     async with db:
@@ -473,15 +596,6 @@ async def create_solo_score(
         db.add(score_token)
         await db.commit()
         await db.refresh(score_token)
-        logger.debug(
-            "User {user_id} created solo score {score_token} for beatmap {beatmap_id} "
-            "(mode: {mode}), using client {client_version}",
-            user_id=user_id,
-            score_token=score_token.id,
-            beatmap_id=beatmap_id,
-            mode=ruleset_id,
-            client_version=str(client_version),
-        )
         return ScoreTokenResp.from_db(score_token)
 
 
@@ -502,7 +616,7 @@ async def submit_solo_score(
     redis: Redis,
     fetcher: Fetcher,
 ):
-    return await submit_score(background_task, info, token, current_user, db, redis, fetcher)
+    return await submit_score(background_task, info, beatmap_id, token, current_user, db, redis, fetcher)
 
 
 @router.post(
@@ -517,9 +631,8 @@ async def create_playlist_score(
     background_task: BackgroundTasks,
     room_id: int,
     playlist_id: int,
-    verification_service: ClientVerificationService,
     beatmap_id: Annotated[int, Form(description="谱面 ID")],
-    beatmap_hash: Annotated[str, Form(description="谱面文件哈希")],
+    beatmap_hash: Annotated[str, Form(description="游戏版本哈希")],
     ruleset_id: Annotated[int, Form(..., description="ruleset 数字 ID (0-3)")],
     current_user: ClientUser,
     version_hash: Annotated[str, Form(description="谱面版本哈希")] = "",
@@ -528,55 +641,39 @@ async def create_playlist_score(
     try:
         gamemode = GameMode.from_int(ruleset_id)
     except ValueError:
-        raise RequestError(ErrorType.INVALID_RULESET_ID)
+        raise HTTPException(status_code=400, detail="Invalid ruleset ID")
 
-    if not (
-        client_version := await verification_service.validate_client_version(
-            version_hash,
-        )
-    ):
-        logger.info(
-            f"Client version check failed for user {current_user.id} on room {room_id}, playlist {playlist_id} "
-            f"(version hash: {version_hash})"
-        )
-        raise RequestError(ErrorType.INVALID_CLIENT_HASH)
-
-    result = gamemode.check_ruleset_version(ruleset_hash)
-    if not result:
+    if not (result := gamemode.check_ruleset_version(ruleset_hash)):
         logger.info(
             f"Ruleset version check failed for user {current_user.id} on room {room_id}, playlist {playlist_id},"
             f" (ruleset: {ruleset_id}, hash: {ruleset_hash})"
         )
-
-        details = {"ruleset_id": ruleset_id, "ruleset_hash": ruleset_hash}
-
-        # The result may have useful information in its own message
-        if result.error_msg:
-            details.update({"error": result.error_msg})
-
-        raise RequestError(ErrorType.RULESET_VERSION_CHECK_FAILED, details)
+        raise HTTPException(
+            status_code=422,
+            detail=result.error_msg or "Ruleset version check failed",
+        )
 
     if await current_user.is_restricted(session):
-        raise RequestError(ErrorType.ACCOUNT_RESTRICTED)
+        raise HTTPException(status_code=403, detail="You are restricted from submitting multiplayer scores")
 
     user_id = current_user.id
 
     room = await session.get(Room, room_id)
     if not room:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Room not found")
     db_room_time = room.ends_at.replace(tzinfo=UTC) if room.ends_at else None
     if db_room_time and db_room_time < utcnow().replace(tzinfo=UTC):
-        raise RequestError(ErrorType.ROOM_HAS_ENDED)
+        raise HTTPException(status_code=400, detail="Room has ended")
     item = (await session.exec(select(Playlist).where(Playlist.id == playlist_id, Playlist.room_id == room_id))).first()
     if not item:
-        raise RequestError(ErrorType.PLAYLIST_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Playlist not found")
 
     # validate
     if not item.freestyle:
         if item.ruleset_id != ruleset_id:
-            raise RequestError(ErrorType.RULESET_MISMATCH_PLAYLIST_ITEM)
+            raise HTTPException(status_code=400, detail="Ruleset mismatch in playlist item")
         if item.beatmap_id != beatmap_id:
-            raise RequestError(ErrorType.BEATMAP_ID_MISMATCH_PLAYLIST_ITEM)
+            raise HTTPException(status_code=400, detail="Beatmap ID mismatch in playlist item")
     agg = await session.exec(
         select(ItemAttemptsCount).where(
             ItemAttemptsCount.room_id == room_id,
@@ -585,11 +682,14 @@ async def create_playlist_score(
     )
     agg = agg.first()
     if agg and room.max_attempts and agg.attempts >= room.max_attempts:
-        raise RequestError(ErrorType.MAX_ATTEMPTS_REACHED)
+        raise HTTPException(
+            status_code=422,
+            detail="You have reached the maximum attempts for this room",
+        )
     if item.expired:
-        raise RequestError(ErrorType.PLAYLIST_ITEM_EXPIRED)
+        raise HTTPException(status_code=400, detail="Playlist item has expired")
     if item.played_at:
-        raise RequestError(ErrorType.PLAYLIST_ITEM_ALREADY_PLAYED)
+        raise HTTPException(status_code=400, detail="Playlist item has already been played")
     # 这里应该不用验证mod了吧。。。
     background_task.add_task(_preload_beatmap_for_pp_calculation, beatmap_id)
     score_token = ScoreToken(
@@ -597,22 +697,10 @@ async def create_playlist_score(
         beatmap_id=beatmap_id,
         ruleset_id=GameMode.from_int(ruleset_id),
         playlist_item_id=playlist_id,
-        room_id=room_id,
     )
     session.add(score_token)
     await session.commit()
     await session.refresh(score_token)
-    logger.debug(
-        "User {user_id} created playlist score {score_token} for beatmap {beatmap_id} "
-        "(mode: {mode}, room {room_id}, item {playlist_id}), using client {client_version}",
-        user_id=user_id,
-        score_token=score_token.id,
-        beatmap_id=beatmap_id,
-        mode=ruleset_id,
-        room_id=room_id,
-        playlist_id=playlist_id,
-        client_version=str(client_version),
-    )
     return ScoreTokenResp.from_db(score_token)
 
 
@@ -635,25 +723,28 @@ async def submit_playlist_score(
     fetcher: Fetcher,
 ):
     if await current_user.is_restricted(session):
-        raise RequestError(ErrorType.ACCOUNT_RESTRICTED)
+        raise HTTPException(status_code=403, detail="You are restricted from submitting multiplayer scores")
 
     user_id = current_user.id
 
     item = (await session.exec(select(Playlist).where(Playlist.id == playlist_id, Playlist.room_id == room_id))).first()
     if not item:
-        raise RequestError(ErrorType.PLAYLIST_ITEM_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Playlist item not found")
     room = await session.get(Room, room_id)
     if not room:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Room not found")
     room_category = room.category
     score_resp = await submit_score(
         background_task,
         info,
+        item.beatmap_id,
         token,
         current_user,
         session,
         redis,
         fetcher,
+        item.id,
+        room_id,
     )
     await process_playlist_best_score(
         room_id,
@@ -705,9 +796,9 @@ async def index_playlist_scores(
 
     room = await session.get(Room, room_id)
     if not room:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Room not found")
 
-    limit = clamp(limit, 1, 50)
+    limit = int(clamp(limit, 1, 50))
 
     scores = (
         await session.exec(
@@ -733,7 +824,6 @@ async def index_playlist_scores(
             "user_id"
         ] == user_id:
             user_score = score
-            user_score["position"] = await get_position(room_id, playlist_id, score["id"], session)
             break
 
     resp = IndexedScoreResp(
@@ -774,7 +864,7 @@ async def show_playlist_score(
 ):
     room = await session.get(Room, room_id)
     if not room:
-        raise RequestError(ErrorType.ROOM_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Room not found")
 
     start_time = time.time()
     score_record = None
@@ -797,7 +887,7 @@ async def show_playlist_score(
         if score_record and completed:
             break
     if not score_record:
-        raise RequestError(ErrorType.SCORE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Score not found")
     includes = [
         *Score.MULTIPLAYER_BASE_INCLUDES,
         "position",
@@ -809,13 +899,13 @@ async def show_playlist_score(
         includes=includes,
         playlist_id=playlist_id,
         room_id=room_id,
-        is_playlist=is_playlist,
+        is_playlist=is_playlist
     )
     return resp
 
 
 @router.get(
-    "/rooms/{room_id}/playlist/{playlist_id}/scores/users/{user_id}",
+    "rooms/{room_id}/playlist/{playlist_id}/scores/users/{user_id}",
     responses={
         200: api_doc(
             "房间项目单个成绩详情。",
@@ -850,7 +940,7 @@ async def get_user_playlist_score(
         if score_record:
             break
     if not score_record:
-        raise RequestError(ErrorType.SCORE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Score not found")
 
     resp = await ScoreModel.transform(
         score_record.score,
@@ -889,7 +979,7 @@ async def pin_score(
         )
     ).first()
     if not score_record:
-        raise RequestError(ErrorType.SCORE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Score not found")
 
     if score_record.pinned_order > 0:
         return
@@ -928,7 +1018,7 @@ async def unpin_score(
 
     score_record = (await db.exec(select(Score).where(Score.id == score_id, Score.user_id == user_id))).first()
     if not score_record:
-        raise RequestError(ErrorType.SCORE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Score not found")
 
     if score_record.pinned_order == 0:
         return
@@ -968,15 +1058,15 @@ async def reorder_score_pin(
 
     score_record = (await db.exec(select(Score).where(Score.id == score_id, Score.user_id == user_id))).first()
     if not score_record:
-        raise RequestError(ErrorType.SCORE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Score not found")
 
     if score_record.pinned_order == 0:
-        raise RequestError(ErrorType.SCORE_NOT_PINNED)
+        raise HTTPException(status_code=400, detail="Score is not pinned")
 
     if (after_score_id is None) == (before_score_id is None):
-        raise RequestError(
-            ErrorType.INVALID_REQUEST,
-            {"error": "Either after_score_id or before_score_id must be provided (but not both)"},
+        raise HTTPException(
+            status_code=400,
+            detail="Either after_score_id or before_score_id must be provided (but not both)",
         )
 
     all_pinned_scores = (
@@ -997,7 +1087,7 @@ async def reorder_score_pin(
     reference_score = next((s for s in all_pinned_scores if s.id == reference_score_id), None)
     if not reference_score:
         detail = "After score not found" if after_score_id else "Before score not found"
-        raise RequestError(ErrorType.SCORE_NOT_FOUND, {"error": detail})
+        raise HTTPException(status_code=404, detail=detail)
 
     target_order = reference_score.pinned_order + 1 if after_score_id else reference_score.pinned_order
 
@@ -1051,12 +1141,12 @@ async def download_score_replay(
 
     score = (await db.exec(select(Score).where(Score.id == score_id))).first()
     if not score:
-        raise RequestError(ErrorType.SCORE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Score not found")
 
     filepath = score.replay_filename
 
     if not await storage_service.is_exists(filepath):
-        raise RequestError(ErrorType.REPLAY_FILE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail="Replay file not found")
 
     is_friend = (
         score.user_id == user_id
