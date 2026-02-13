@@ -290,7 +290,7 @@ class BeatmapScores(BaseModel):
                 "排行榜及当前用户成绩。\n\n"
                 f"如果 `x-api-version >= 20220705`，返回值为 `BeatmapScores[Score]`"
                 f" （包含：{', '.join([f'`{inc}`' for inc in DEFAULT_SCORE_INCLUDES])}），"
-                "否则为 `BeatmapScores[LegacyScoreResp]`。"
+                "否则 for `BeatmapScores[LegacyScoreResp]`。"
             ),
         }
     },
@@ -301,9 +301,10 @@ async def get_beatmap_scores(
     db: Database,
     api_version: APIVersion,
     beatmap_id: Annotated[int, Path(description="谱面 ID")],
-    mode: Annotated[GameMode, Query(description="指定 auleset")],
+    mode: Annotated[GameMode, Query(description="指定 ruleset")],
     mods: Annotated[list[str], Query(default_factory=set, alias="mods[]", description="筛选使用的 Mods (可选，多值)")],
     current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
+    fetcher: Annotated[Fetcher, Depends(get_fetcher)],
     legacy_only: Annotated[bool | None, Query(description="是否只查询 Stable 分数")] = None,
     type: Annotated[
         LeaderboardType,
@@ -313,6 +314,12 @@ async def get_beatmap_scores(
     ] = LeaderboardType.GLOBAL,
     limit: Annotated[int, Query(ge=1, le=200, description="返回条数 (1-200)")] = 50,
 ):
+    # Ensure beatmap exists in local DB, fetch if missing
+    try:
+        await Beatmap.get_or_fetch(db, fetcher, bid=beatmap_id)
+    except Exception as e:
+        logger.warning(f"Failed to fetch beatmap {beatmap_id} for leaderboard: {e}")
+
     # Check if this is a Rhythia beatmap
     from sqlmodel import select
     rhythia_beatmap = (await db.exec(select(RhythiaBeatmap).where(RhythiaBeatmap.id == beatmap_id))).first()
@@ -561,6 +568,7 @@ async def get_user_all_beatmap_scores(
 async def create_solo_score(
     background_task: BackgroundTasks,
     db: Database,
+    fetcher: Fetcher,
     beatmap_id: Annotated[int, Path(description="谱面 ID")],
     beatmap_hash: Annotated[str, Form(description="谱面文件哈希")],
     ruleset_id: Annotated[int, Form(..., description="ruleset 数字 ID (0-3)")],
@@ -585,6 +593,9 @@ async def create_solo_score(
             status_code=422,
             detail=result.error_msg or "Ruleset version check failed",
         )
+
+    # 确保谱面存在于数据库中，防止外键约束失败
+    await Beatmap.get_or_fetch(db, fetcher, bid=beatmap_id)
 
     background_task.add_task(_preload_beatmap_for_pp_calculation, beatmap_id)
     async with db:
@@ -629,6 +640,7 @@ async def submit_solo_score(
 async def create_playlist_score(
     session: Database,
     background_task: BackgroundTasks,
+    fetcher: Fetcher,
     room_id: int,
     playlist_id: int,
     beatmap_id: Annotated[int, Form(description="谱面 ID")],
@@ -655,6 +667,9 @@ async def create_playlist_score(
 
     if await current_user.is_restricted(session):
         raise HTTPException(status_code=403, detail="You are restricted from submitting multiplayer scores")
+
+    # 确保谱面存在于数据库中，防止外键约束失败
+    await Beatmap.get_or_fetch(session, fetcher, bid=beatmap_id)
 
     user_id = current_user.id
 
