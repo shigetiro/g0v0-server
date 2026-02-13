@@ -3,8 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import logging
 
-from app.models.error import ErrorType, RequestError
-
+from fastapi import HTTPException
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -200,8 +199,8 @@ class BeatmapDownloadService:
         healthy_endpoints.sort(key=lambda x: x.priority)
         return healthy_endpoints
 
-    def get_download_url(self, beatmapset_id: int, no_video: bool, is_china: bool) -> str:
-        """获取下载URL，带负载均衡和故障转移"""
+    def get_download_urls(self, beatmapset_id: int, no_video: bool, is_china: bool) -> list[str]:
+        """获取下载URL列表，带负载均衡和故障转移"""
         healthy_endpoints = self.get_healthy_endpoints(is_china)
 
         if not healthy_endpoints:
@@ -209,23 +208,25 @@ class BeatmapDownloadService:
             logger.error(f"No healthy endpoints available for is_china={is_china}")
             endpoints = self.china_endpoints if is_china else self.international_endpoints
             if not endpoints:
-                raise RequestError(ErrorType.NO_DOWNLOAD_ENDPOINTS_AVAILABLE)
-            endpoint = min(endpoints, key=lambda x: x.priority)
+                raise HTTPException(status_code=503, detail="No download endpoints available")
+            ordered_endpoints = sorted(endpoints, key=lambda x: x.priority)
         else:
-            # 使用第一个健康的端点（已按优先级排序）
-            endpoint = healthy_endpoints[0]
+            ordered_endpoints = healthy_endpoints
 
-        # 根据端点类型生成URL
-        if endpoint.name == "Sayobot":
-            video_type = "novideo" if no_video else "full"
-            return endpoint.url_template.format(type=video_type, sid=beatmapset_id)
-        elif endpoint.name == "Nerinyan" or endpoint.name == "OsuDirect":
-            return endpoint.url_template.format(sid=beatmapset_id, no_video="true" if no_video else "false")
-        elif endpoint.name == "Catboy":
-            return endpoint.url_template.format(sid=f"{beatmapset_id}n" if no_video else beatmapset_id)
-        else:
-            # 默认处理
-            return endpoint.url_template.format(sid=beatmapset_id)
+        # 构造备选 URL 列表
+        urls = []
+        for endpoint in ordered_endpoints:
+            if endpoint.name == "Sayobot":
+                video_type = "novideo" if no_video else "full"
+                urls.append(endpoint.url_template.format(type=video_type, sid=beatmapset_id))
+            elif endpoint.name == "Nerinyan" or endpoint.name == "OsuDirect":
+                urls.append(endpoint.url_template.format(sid=beatmapset_id, no_video="true" if no_video else "false"))
+            elif endpoint.name == "Catboy":
+                urls.append(endpoint.url_template.format(sid=f"{beatmapset_id}n" if no_video else beatmapset_id))
+            else:
+                urls.append(endpoint.url_template.format(sid=beatmapset_id))
+
+        return urls
 
     def get_service_status(self) -> dict:
         """获取服务状态信息"""
