@@ -8,9 +8,12 @@ from httpx import AsyncClient, HTTPError, Limits
 import redis.asyncio as redis
 
 urls = [
+    # SSPM stored file served by our server (auto-imported Rhythia/SSPM maps)
     "https://osu.ppy.sh/osu/{beatmap_id}",
     "https://osu.direct/api/osu/{beatmap_id}",
     "https://catboy.best/osu/{beatmap_id}",
+    "https://nerinyan.me/api/osu/{beatmap_id}",
+    "https://api.chimu.moe/v1/download/{beatmap_id}?n=1",
 ]
 
 logger = fetcher_logger("BeatmapRawFetcher")
@@ -111,8 +114,17 @@ class BeatmapRawFetcher(BaseFetcher):
         client = await self._get_client()
         last_error = None
 
+        # Build URLs dynamically to inject server_url for SSPM route
+        try:
+            from app.config import settings  # local import to avoid cyclic at module import
+            server_url = str(settings.server_url)
+            if not server_url.endswith("/"):
+                server_url += "/"
+        except Exception:
+            server_url = "http://localhost/"
+
         for url_template in urls:
-            req_url = url_template.format(beatmap_id=beatmap_id)
+            req_url = url_template.format(beatmap_id=beatmap_id, server_url=server_url)
             try:
                 logger.opt(colors=True).debug(f"get_beatmap_raw: <y>{req_url}</y>")
                 resp = await client.get(req_url)

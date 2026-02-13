@@ -139,9 +139,51 @@ class BeatmapsetFetcher(BaseFetcher):
 
     async def get_beatmapset(self, beatmap_set_id: int) -> BeatmapsetDict:
         logger.opt(colors=True).debug(f"get_beatmapset: <y>{beatmap_set_id}</y>")
-        return adapter.validate_python(  # pyright: ignore[reportReturnType]
-            await self.request_api(f"https://osu.ppy.sh/api/v2/beatmapsets/{beatmap_set_id}")
-        )
+        from httpx import HTTPStatusError
+
+        try:
+            return adapter.validate_python(  # pyright: ignore[reportReturnType]
+                await self.request_api(
+                    f"https://osu.ppy.sh/api/v2/beatmapsets/{beatmap_set_id}"
+                )
+            )
+        except HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(
+                    f"Beatmapset {beatmap_set_id} not found on osu.ppy.sh, trying mirrors..."
+                )
+                # Try mirrors if official API fails with 404
+                mirrors = [
+                    f"https://api.nerinyan.moe/search?q={beatmap_set_id}",
+                    f"https://catboy.best/api/v2/s/{beatmap_set_id}",
+                    f"https://storage.ripple.moe/api/s/{beatmap_set_id}",
+                ]
+                for mirror_url in mirrors:
+                    try:
+                        logger.debug(f"Trying mirror: {mirror_url}")
+                        # Use a clean request without OAuth headers for mirrors
+                        from httpx import AsyncClient
+
+                        async with AsyncClient(timeout=10.0) as client:
+                            resp = await client.get(mirror_url)
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                # Handle different mirror response formats if necessary
+                                # Chimu and Nerinyan might need mapping to osu! API format
+                                # For now, we try to validate directly or log failure
+                                try:
+                                    return adapter.validate_python(data)
+                                except Exception as val_err:
+                                    logger.warning(
+                                        f"Mirror {mirror_url} returned incompatible data: {val_err}"
+                                    )
+                                    continue
+                    except Exception as mirror_err:
+                        logger.warning(
+                            f"Failed to fetch from mirror {mirror_url}: {mirror_err}"
+                        )
+                        continue
+            raise
 
     async def search_beatmapset(
         self, query: SearchQueryModel, cursor: Cursor, redis_client: redis.Redis
