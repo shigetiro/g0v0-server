@@ -193,6 +193,12 @@ async def get_channel(
 
     users = []
     if channel_type == ChannelType.PM:
+        if not channel_name:
+            raise HTTPException(
+                status_code=500,
+                detail="PM channel has NULL name in database"
+            )
+
         user_ids = channel_name.split("_")[1:]
         if len(user_ids) != 2:
             raise HTTPException(status_code=404, detail="Target user not found")
@@ -262,27 +268,47 @@ async def create_channel(
         if not is_can_pm:
             raise HTTPException(status_code=403, detail=block)
 
+	#this is pretty bad, because mutual codes will conflict
+        # --- FIX START: Calcular orden correcto para evitar NULLs y duplicados ---
+        user_min = min(current_user.id, req.target_id)
+        user_max = max(current_user.id, req.target_id)
+        channel_name = f"pm_{user_min}_{user_max}"
+        # --- FIX END ---
+
         channel = await ChatChannel.get_pm_channel(
             current_user.id,
             req.target_id,  # pyright: ignore[reportArgumentType]
             session,
         )
-        channel_name = f"pm_{current_user.id}_{req.target_id}"
+        #channel = await ChatChannel.get_pm_channel(
+        #    current_user.id,
+        #    req.target_id,  # pyright: ignore[reportArgumentType]
+        #    session,
+        #)
+        #channel_name = f"pm_{current_user.id}_{req.target_id}"
     else:
         channel_name = req.channel.name if req.channel else "Unnamed Channel"
         result = await session.exec(select(ChatChannel).where(ChatChannel.channel_name == channel_name))
         channel = result.first()
 
+    #if channel is None:
+    #    channel = ChatChannel(
+    #        name=channel_name,
+    #        description=req.channel.description if req.channel else "Private message channel",
+    #        type=ChannelType.PM if req.type == "PM" else ChannelType.ANNOUNCE,
+    #    )
     if channel is None:
         channel = ChatChannel(
-            name=channel_name,
-            description=req.channel.description if req.channel else "Private message channel",
-            type=ChannelType.PM if req.type == "PM" else ChannelType.ANNOUNCE,
+            channel_name=channel_name,
+            description="Private message channel",
+            type=ChannelType.PM,
         )
         session.add(channel)
         await session.commit()
         await session.refresh(channel)
         await session.refresh(current_user)
+
+
     if req.type == "PM":
         await session.refresh(target)  # pyright: ignore[reportPossiblyUnboundVariable]
         await server.batch_join_channel([target, current_user], channel)  # pyright: ignore[reportPossiblyUnboundVariable]

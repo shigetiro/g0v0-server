@@ -1,6 +1,7 @@
 from datetime import UTC, date
 import time
 from typing import Annotated
+import asyncio
 
 from app.calculator import clamp
 from app.config import settings
@@ -133,13 +134,23 @@ async def submit_score(
     # 立即获取用户ID，避免后续的懒加载问题
     user_id = current_user.id
 
+    logger.info(
+        "[submit_score] start user_id={} token={} passed={} rank={}",
+        user_id,
+        token,
+        info.passed,
+        getattr(info, "rank", None),
+    )
+
     if not info.passed:
         info.rank = Rank.F
+
     score_token = (
         await db.exec(select(ScoreToken).options(joinedload(ScoreToken.beatmap)).where(ScoreToken.id == token))
     ).first()
     if not score_token or score_token.user_id != user_id:
         raise HTTPException(status_code=404, detail="Score token not found")
+
     if score_token.score_id:
         score = (
             await db.exec(
@@ -153,6 +164,7 @@ async def submit_score(
             raise HTTPException(status_code=404, detail="Score not found")
     else:
         beatmap = score_token.beatmap_id
+
         try:
             cache_service = get_beatmap_cache_service(redis, fetcher)
             await cache_service.smart_preload_for_score(beatmap)
@@ -163,7 +175,12 @@ async def submit_score(
             db_beatmap = await Beatmap.get_or_fetch(db, fetcher, bid=beatmap)
         except HTTPError:
             raise HTTPException(status_code=404, detail="Beatmap not found")
+
         status = db_beatmap.beatmap_status
+
+        t0 = time.time()
+        logger.info("[submit_score] calling process_score user_id={} beatmap_id={} status={}", user_id, beatmap, status)
+
         score = await process_score(
             current_user,
             beatmap,
@@ -172,22 +189,87 @@ async def submit_score(
             info,
             db,
         )
+
+        logger.info(
+            "[submit_score] process_score done in {:.3f}s score_id={} user_id={} beatmap_id={}",
+            time.time() - t0,
+            score.id,
+            user_id,
+            beatmap,
+        )
+
         await db.refresh(score_token)
         score_id = score.id
         score_token.score_id = score_id
+
+        t_commit = time.time()
         await db.commit()
         await db.refresh(score)
+        logger.info(
+            "[submit_score] db commit+refresh done in {:.3f}s score_id={}",
+            time.time() - t_commit,
+            score_id,
+        )
 
-        background_task.add_task(_process_user, score_id, user_id, redis, fetcher)
-    resp = await ScoreModel.transform(
-        score,
-    )
+        # ✅ Important: do PP/rank/stats update BEFORE responding
+        t_user = time.time()
+        logger.info("[submit_score] BEFORE _process_user score_id={} user_id={}", score_id, user_id)
+        try:
+            await _process_user(score_id, user_id, redis, fetcher)
+            logger.info(
+                "[submit_score] AFTER _process_user in {:.3f}s score_id={} user_id={}",
+                time.time() - t_user,
+                score_id,
+                user_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[submit_score] _process_user FAILED in {:.3f}s score_id={} user_id={} err={}",
+                time.time() - t_user,
+                score_id,
+                user_id,
+                e,
+            )
+
+    # Build response from final score object (after processing)
+    t_resp = time.time()
+    resp = await ScoreModel.transform(score)
+    logger.info("[submit_score] ScoreModel.transform done in {:.3f}s score_id={}", time.time() - t_resp, resp["id"])
+
     score_gamemode = score.gamemode
 
+    # Commit any remaining session state (should be cheap/no-op usually)
+    t_commit2 = time.time()
     await db.commit()
+    logger.info("[submit_score] final db.commit done in {:.3f}s score_id={}", time.time() - t_commit2, resp["id"])
+
+    # ✅ Refresh cache BEFORE returning so client reads updated stats
     if user_id is not None:
-        background_task.add_task(refresh_user_cache_background, redis, user_id, score_gamemode)
+        t_cache = time.time()
+        logger.info(
+            "[submit_score] BEFORE refresh_user_cache_background user_id={} mode={}",
+            user_id,
+            score_gamemode,
+        )
+        try:
+            await refresh_user_cache_background(redis, user_id, score_gamemode)
+            logger.info(
+                "[submit_score] AFTER refresh_user_cache_background in {:.3f}s user_id={}",
+                time.time() - t_cache,
+                user_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[submit_score] refresh_user_cache_background FAILED in {:.3f}s user_id={} err={}",
+                time.time() - t_cache,
+                user_id,
+                e,
+            )
+
+    # Achievements can stay async
     background_task.add_task(_process_user_achievement, resp["id"])
+
+    logger.info("[submit_score] END user_id={} score_id={}", user_id, resp["id"])
     return resp
 
 
@@ -773,6 +855,7 @@ async def show_playlist_score(
     score_record = None
     is_playlist = room.category != RoomCategory.REALTIME
     completed = is_playlist
+
     while time.time() - start_time < READ_SCORE_TIMEOUT:
         if score_record is None:
             score_record = (
@@ -785,18 +868,29 @@ async def show_playlist_score(
                     )
                 )
             ).first()
-        if completed_players := await redis.get(f"multiplayer:{room_id}:gameplay:players"):
-            completed = completed_players == "0"
-        if score_record and completed:
+
+        # solo usamos "completed" para decidir si agregar scores_around,
+        # pero NO bloqueamos la respuesta esperando a que sea true.
+        if not completed:
+            if completed_players := await redis.get(f"multiplayer:{room_id}:gameplay:players"):
+                completed = completed_players == "0"
+
+        # ✅ clave: si el score ya existe, respondemos ya.
+        if score_record:
             break
+
+        await asyncio.sleep(0.05)
+
     if not score_record:
         raise HTTPException(status_code=404, detail="Score not found")
+
     includes = [
         *Score.MULTIPLAYER_BASE_INCLUDES,
         "position",
     ]
     if completed:
         includes.append("scores_around")
+
     resp = await ScoreModel.transform(
         score_record.score,
         includes=includes,
@@ -808,7 +902,7 @@ async def show_playlist_score(
 
 
 @router.get(
-    "rooms/{room_id}/playlist/{playlist_id}/scores/users/{user_id}",
+    "/rooms/{room_id}/playlist/{playlist_id}/scores/users/{user_id}",
     responses={
         200: api_doc(
             "房间项目单个成绩详情。",

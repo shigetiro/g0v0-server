@@ -4,6 +4,10 @@ from pathlib import Path
 
 from app.calculator import init_calculator
 from app.config import settings
+
+print("CHECK_CLIENT_VERSION env raw =", repr(getattr(settings, "check_client_version", None)))
+print("CLIENT_VERSION_URLS =", getattr(settings, "client_version_urls", None))
+
 from app.database import User
 from app.dependencies.database import (
     Database,
@@ -19,6 +23,7 @@ from app.log import system_logger
 from app.middleware.verify_session import VerifySessionMiddleware
 from app.models.mods import init_mods, init_ranked_mods
 from app.models.score import init_ruleset_version_hash
+from app.router.notification.server import chat_router
 from app.router import (
     api_v1_router,
     api_v2_router,
@@ -68,6 +73,9 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     init_ruleset_version_hash()
     load_achievements()
     await init_calculator()
+
+
+    #print("CHECK_CLIENT_VERSION setting:", settings.check_client_version)
 
     if settings.check_client_version:
         await init_client_verification_service()

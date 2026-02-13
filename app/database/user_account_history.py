@@ -12,10 +12,10 @@ if TYPE_CHECKING:
 
 
 class UserAccountHistoryType(str, Enum):
-    NOTE = "note"
-    RESTRICTION = "restriction"
-    SLIENCE = "silence"
-    TOURNAMENT_BAN = "tournament_ban"
+    NOTE = "NOTE"
+    RESTRICTION = "RESTRICTION"
+    SILENCE = "SILENCE"
+    TOURNAMENT_BAN = "TOURNAMENT_BAN"
 
 
 class UserAccountHistoryBase(SQLModel, UTCBaseModel):

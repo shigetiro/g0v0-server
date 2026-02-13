@@ -310,7 +310,6 @@ class UserModel(DatabaseModel[UserDict]):
     # undocumented
     comments_count: OnDemand[int] = Field(default=0)
     post_count: OnDemand[int] = Field(default=0)
-    is_admin: OnDemand[bool] = Field(default=False)
     is_gmt: OnDemand[bool] = Field(default=False)
     is_qat: OnDemand[bool] = Field(default=False)
     is_bng: OnDemand[bool] = Field(default=False)
@@ -384,6 +383,16 @@ class UserModel(DatabaseModel[UserDict]):
     @staticmethod
     async def is_deleted(_session: AsyncSession, _obj: "User") -> bool:
         return False
+
+    @included
+    @staticmethod
+    async def is_admin(_session, obj: "User") -> bool:
+        return bool(getattr(obj, "is_admin", False))
+
+    # @ondemand
+    # @staticmethod
+    # async def is_admin(_session, obj: "User") -> bool:
+    #     return bool(getattr(obj, "is_admin", False))
 
     @ondemand
     @staticmethod
@@ -700,6 +709,7 @@ class User(AsyncAttrs, UserModel, table=True):
 
     email: str = Field(max_length=254, unique=True, index=True)
     priv: int = Field(default=1)
+    is_admin: bool = Field(default=False)
     pw_bcrypt: str = Field(max_length=60)
     silence_end_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
     donor_end_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))

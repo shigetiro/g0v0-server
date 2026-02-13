@@ -13,6 +13,11 @@ from app.helpers.asset_proxy_helper import replace_asset_urls
 from app.log import logger
 from app.models.score import GameMode
 from app.utils import safe_json_dumps, utcnow
+from sqlalchemy import and_, func, literal_column, or_
+from app.database.user_account_history import (
+    UserAccountHistory,
+    UserAccountHistoryType,
+)
 
 from redis.asyncio import Redis
 from sqlmodel import col, select
@@ -20,6 +25,25 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 if TYPE_CHECKING:
     pass
+
+def _user_is_currently_restricted_expr():
+    # MySQL: TIMESTAMPADD(SECOND, length, timestamp) > NOW()
+    second_unit = literal_column("SECOND")
+
+    return select(UserAccountHistory.user_id).where(
+        and_(
+            or_(
+                UserAccountHistory.type == UserAccountHistoryType.RESTRICTION,
+                UserAccountHistory.type == "RESTRICTION",
+            ),
+            UserAccountHistory.timestamp <= func.now(),
+            or_(
+                UserAccountHistory.permanent.is_(True),
+                func.timestampadd(second_unit, UserAccountHistory.length, UserAccountHistory.timestamp) > func.now(),
+            ),
+        )
+    )
+
 
 
 class RankingCacheService:
@@ -291,9 +315,12 @@ class RankingCacheService:
             logger.info(f"Starting ranking cache refresh for {ruleset}:{type}")
 
             # 构建查询条件
+            restricted_users_subq = _user_is_currently_restricted_expr()
             wheres = [
                 col(UserStatistics.mode) == ruleset,
                 col(UserStatistics.pp) > 0,
+		col(UserStatistics.user).has(is_active=True),
+		~col(UserStatistics.user_id).in_(restricted_users_subq),
                 col(UserStatistics.is_ranked).is_(True),
             ]
             include = UserStatistics.RANKING_INCLUDES.copy()

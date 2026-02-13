@@ -66,11 +66,32 @@ async def process_playlist_best_score(
             total_score=total_score,
         )
         session.add(previous)
-    elif not previous.score.passed or previous.total_score < total_score:
-        previous.score_id = score_id
-        previous.total_score = total_score
+    else:
+        from .score import Score  # import local para evitar imports circulares
+
+        new_score = (
+            await session.exec(
+                select(Score).where(Score.id == score_id)
+            )
+        ).first()
+
+        new_passed = bool(new_score.passed) if new_score else False
+        prev_passed = bool(previous.score.passed)
+
+        should_replace = False
+
+        # Preferir PASSED sobre FAILED
+        if not prev_passed and new_passed:
+            should_replace = True
+        # Si ambos tienen el mismo estado (ambos passed o ambos failed), gana el mayor total_score
+        elif prev_passed == new_passed and total_score > previous.total_score:
+            should_replace = True
+
+        if should_replace:
+            previous.score_id = score_id
+            previous.total_score = total_score
     previous.attempts += 1
-    await session.commit()
+    await session.flush()
     if await redis.exists(f"multiplayer:{room_id}:gameplay:players"):
         await redis.decr(f"multiplayer:{room_id}:gameplay:players")
 

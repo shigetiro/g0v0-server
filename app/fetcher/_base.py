@@ -4,6 +4,7 @@ import time
 
 from app.dependencies.database import get_redis
 from app.log import fetcher_logger
+from app.utils import utcnow
 
 from httpx import AsyncClient, HTTPStatusError, TimeoutException
 
@@ -55,7 +56,8 @@ class PassiveRateLimiter:
                 # 尝试解析 HTTP 日期格式
                 try:
                     retry_time = datetime.strptime(retry_after, "%a, %d %b %Y %H:%M:%S %Z")
-                    wait_seconds = max(0, (retry_time - datetime.utcnow()).total_seconds())
+                    #wait_seconds = max(0, (retry_time - datetime.utcnow()).total_seconds())
+                    wait_seconds = max(0, (retry_time - utcnow()).total_seconds())
                 except ValueError:
                     # 解析失败，默认等待 60 秒
                     wait_seconds = 60

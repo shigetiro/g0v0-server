@@ -30,7 +30,7 @@ logger = log("NotificationServer")
 
 class ChatServer:
     def __init__(self):
-        self.connect_client: dict[int, WebSocket] = {}
+        self.connect_client: dict[int, set[WebSocket]] = {} #to allow both browser and ingame messaging
         self.channels: dict[int, list[int]] = {}
         self.redis: Redis = redis_message_client
 
@@ -40,33 +40,47 @@ class ChatServer:
         self._subscribed = False
 
     def connect(self, user_id: int, client: WebSocket):
-        self.connect_client[user_id] = client
+        if user_id not in self.connect_client:
+            self.connect_client[user_id] = set()
+        self.connect_client[user_id].add(client)
+
 
     def get_user_joined_channel(self, user_id: int) -> list[int]:
         return [channel_id for channel_id, users in self.channels.items() if user_id in users]
 
-    async def disconnect(self, user: User, session: AsyncSession):
+    async def disconnect(self, user: User, session: AsyncSession, client: WebSocket | None = None):
         user_id = user.id
-        if user_id in self.connect_client:
-            del self.connect_client[user_id]
 
-        # 创建频道ID列表的副本以避免在迭代过程中修改字典
+        # remove only the disconnected websocket (if provided)
+        if client is not None:
+            ws_set = self.connect_client.get(user_id)
+            if ws_set:
+                ws_set.discard(client)
+                if not ws_set:
+                    self.connect_client.pop(user_id, None)
+        else:
+            # fallback: old behavior (only if you truly don't know which socket)
+            self.connect_client.pop(user_id, None)
+
+        # If user still has an active socket, DO NOT remove them from channels.
+        if user_id in self.connect_client:
+            return
+
+        # --- original channel cleanup logic (only when last socket is gone) ---
         channel_ids_to_process = []
         for channel_id, channel in self.channels.items():
             if user_id in channel:
                 channel_ids_to_process.append(channel_id)
 
-        # 现在安全地处理每个频道
         for channel_id in channel_ids_to_process:
-            # 再次检查用户是否仍在频道中（防止并发修改）
             if channel_id in self.channels and user_id in self.channels[channel_id]:
                 self.channels[channel_id].remove(user_id)
-                # 使用明确的查询避免延迟加载
                 db_channel = (
                     await session.exec(select(ChatChannel).where(ChatChannel.channel_id == channel_id))
                 ).first()
                 if db_channel:
                     await self.leave_channel(user, db_channel)
+
 
     @overload
     async def send_event(self, client: int, event: ChatEvent): ...
@@ -75,19 +89,46 @@ class ChatServer:
     async def send_event(self, client: WebSocket, event: ChatEvent): ...
 
     async def send_event(self, client: WebSocket | int, event: ChatEvent):
+        # resolve sockets
         if isinstance(client, int):
-            client_ = self.connect_client.get(client)
-            if client_ is None:
+            user_id = client
+            sockets = set(self.connect_client.get(user_id, set()))
+            if not sockets:
                 return
-            client = client_
-        if client.client_state == WebSocketState.CONNECTED:
-            await client.send_text(safe_json_dumps(event))
+        else:
+            # send to a single socket (rare path)
+            user_id = None
+            sockets = {client}
+
+        dead: set[WebSocket] = set()
+
+        payload = safe_json_dumps(event)
+
+        for ws in sockets:
+            if ws.client_state != WebSocketState.CONNECTED:
+                dead.add(ws)
+                continue
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead.add(ws)
+
+        # cleanup dead sockets
+        if isinstance(client, int) and dead:
+            ws_set = self.connect_client.get(user_id)
+            if ws_set:
+                for ws in dead:
+                    ws_set.discard(ws)
+                if not ws_set:
+                    self.connect_client.pop(user_id, None)
+
+
 
     async def broadcast(self, channel_id: int, event: ChatEvent):
-        users_in_channel = self.channels.get(channel_id, [])
+        users_in_channel = list(self.channels.get(channel_id, []))
         logger.info(f"Broadcasting to channel {channel_id}, users: {users_in_channel}")
 
-        # 如果频道中没有用户，检查是否是多人游戏频道
+        # Tu debug de multiplayer, igual que antes
         if not users_in_channel:
             try:
                 async with with_db() as session:
@@ -96,14 +137,18 @@ class ChatServer:
                         logger.warning(
                             f"No users in multiplayer channel {channel_id}, message will not be delivered to anyone"
                         )
-                        # 对于多人游戏房间，这可能是正常的（用户都离开了房间）
-                        # 但我们仍然记录这个情况以便调试
             except Exception as e:
                 logger.error(f"Failed to check channel type for {channel_id}: {e}")
+            return
 
-        for user_id in users_in_channel:
-            await self.send_event(user_id, event)
-            logger.debug(f"Sent event to user {user_id} in channel {channel_id}")
+        # Enviar a todos aislando fallos por usuario
+        tasks = [self.send_event(user_id, event) for user_id in users_in_channel]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # send_event ya traga/loggea casi todo, pero por si algo raro burbujea:
+        for user_id, res in zip(users_in_channel, results):
+            if isinstance(res, Exception):
+                logger.debug(f"broadcast exception for user {user_id}: {type(res).__name__}: {res}")
 
     async def mark_as_read(self, channel_id: int, user_id: int, message_id: int):
         await self.redis.set(f"chat:{channel_id}:last_read:{user_id}", message_id)
@@ -116,28 +161,23 @@ class ChatServer:
 
         event = ChatEvent(
             event="chat.message.new",
-            data={"messages": [message], "users": [message["sender"]]},  # pyright: ignore[reportTypedDictNotRequiredAccess]
+            data={"messages": [message], "users": [message["sender"]]},
         )
+
         if is_bot_command:
             logger.info(f"Sending bot command to user {message['sender_id']}")
-            bg_tasks.add_task(self.send_event, message["sender_id"], event)
+            asyncio.create_task(self.send_event(message["sender_id"], event))
         else:
-            # 总是广播消息，无论是临时ID还是真实ID
             logger.info(f"Broadcasting message to all users in channel {message['channel_id']}")
-            bg_tasks.add_task(
-                self.broadcast,
-                message["channel_id"],
-                event,
-            )
+            asyncio.create_task(self.broadcast(message["channel_id"], event))
 
-        # 只有真实消息 ID（正数且非零）才进行标记已读和设置最后消息
-        # Redis 消息系统生成的ID都是正数，所以这里应该都能正常处理
         if message["message_id"] and message["message_id"] > 0:
-            await self.mark_as_read(message["channel_id"], message["sender_id"], message["message_id"])
-            await self.redis.set(f"chat:{message['channel_id']}:last_msg", message["message_id"])
-            logger.info(f"Updated last message ID for channel {message['channel_id']} to {message['message_id']}")
-        else:
-            logger.debug(f"Skipping last message update for message ID: {message['message_id']}")
+            try:
+                await self.mark_as_read(message["channel_id"], message["sender_id"], message["message_id"])
+                await self.redis.set(f"chat:{message['channel_id']}:last_msg", message["message_id"])
+                logger.info(f"Updated last message ID for channel {message['channel_id']} to {message['message_id']}")
+            except Exception:
+                logger.exception("Failed to mark as read / update last_msg")
 
     async def batch_join_channel(self, users: list[User], channel: ChatChannel):
         channel_id = channel.channel_id
@@ -261,20 +301,13 @@ server = ChatServer()
 chat_router = APIRouter(include_in_schema=False)
 
 
-async def _listen_stop(ws: WebSocket, user_id: int, factory: DBFactory):
+async def _listen_stop(ws: WebSocket, user_id: int):
     try:
         while True:
             packets = await ws.receive_json()
             if packets.get("event") == "chat.end":
-                async for session in factory():
-                    user = await session.get(User, user_id)
-                    if user is None:
-                        break
-                    await server.disconnect(user, session)
                 await ws.close(code=1000)
                 break
-    except WebSocketDisconnect as e:
-        logger.info(f"Client {user_id} disconnected: {e.code}, {e.reason}")
     except RuntimeError as e:
         if "disconnect message" in str(e):
             logger.info(f"Client {user_id} closed the connection.")
@@ -282,7 +315,6 @@ async def _listen_stop(ws: WebSocket, user_id: int, factory: DBFactory):
             logger.exception(f"RuntimeError in client {user_id}: {e}")
     except Exception:
         logger.exception(f"Error in client {user_id}")
-
 
 @chat_router.websocket("/notification-server")
 async def chat_websocket(
@@ -296,35 +328,61 @@ async def chat_websocket(
         server._subscribed = True
         await server.ChatSubscriber.start_subscribe()
 
-    async for session in factory():
-        # 优先使用查询参数中的token，支持token或access_token参数名
-        auth_token = token or access_token
-        if not auth_token and authorization:
-            auth_token = authorization.removeprefix("Bearer ")
+    user: User | None = None
+    user_id: int | None = None
+    session: AsyncSession | None = None
 
-        if not auth_token:
-            await websocket.close(code=1008, reason="Missing authentication token")
-            return
+    try:
+        async for session in factory():
+            # 优先使用查询参数中的token，支持token或access_token参数名
+            auth_token = token or access_token
+            if not auth_token and authorization:
+                auth_token = authorization.removeprefix("Bearer ")
 
-        if (
-            user_and_token := await get_current_user_and_token(
+            if not auth_token:
+                await websocket.close(code=1008, reason="Missing authentication token")
+                return
+
+            user_and_token = await get_current_user_and_token(
                 session, SecurityScopes(scopes=["chat.read"]), token_pw=auth_token
             )
-        ) is None:
-            await websocket.close(code=1008, reason="Invalid or expired token")
-            return
+            if user_and_token is None:
+                await websocket.close(code=1008, reason="Invalid or expired token")
+                return
 
-        await websocket.accept()
-        login = await websocket.receive_json()
-        if login.get("event") != "chat.start":
-            await websocket.close(code=1008)
-            return
-        user = user_and_token[0]
-        user_id = user.id
-        server.connect(user_id, websocket)
-        # 使用明确的查询避免延迟加载
-        db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == 1))).first()
-        if db_channel is not None:
-            await server.join_channel(user, db_channel)
+            await websocket.accept()
 
-        await _listen_stop(websocket, user_id, factory)
+            # ⚠️ ESTA ES LA LINEA QUE TE TIRA TRACEBACK SI SE DESCONECTA ANTES/EN LOGIN
+            login = await websocket.receive_json()
+            if login.get("event") != "chat.start":
+                await websocket.close(code=1008)
+                return
+
+            user = user_and_token[0]
+            user_id = user.id
+
+            server.connect(user_id, websocket)
+
+            db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == 1))).first()
+            if db_channel is not None:
+                await server.join_channel(user, db_channel)
+
+            await _listen_stop(websocket, user_id)
+            return  # importante: salimos del handler cuando termina
+
+    except WebSocketDisconnect as e:
+        # ✅ desconexión normal: NO traceback
+        logger.info(
+            f"Client {user_id or 'unknown'} disconnected: "
+            f"{e.code}, {getattr(e, 'reason', '')}"
+        )
+        return
+    except Exception:
+        logger.exception(f"Websocket crashed for client {user_id}")
+        return
+    finally:
+        if user is not None and session is not None:
+            try:
+                await server.disconnect(user, websocket, session)
+            except Exception:
+                logger.exception(f"Cleanup failed for client {user_id}")

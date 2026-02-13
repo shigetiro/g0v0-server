@@ -285,16 +285,24 @@ async def create_new_pm(
 
     channel = await ChatChannel.get_pm_channel(user_id, req.target_id, session)
     if channel is None:
-        channel = ChatChannel(
-            name=f"pm_{user_id}_{req.target_id}",
-            description="Private message channel",
-            type=ChannelType.PM,
-        )
-        session.add(channel)
-        await session.commit()
-        await session.refresh(channel)
-        await session.refresh(target)
-        await session.refresh(current_user)
+        user_min = min(user_id, req.target_id)
+        user_max = max(user_id, req.target_id)
+        pm_name = f"pm_{user_min}_{user_max}"
+
+        channel = await ChatChannel.get_pm_channel(user_id, req.target_id, session)
+        if channel is None:
+            channel = ChatChannel(
+                channel_name=pm_name,  # ✅ correct field -> DB column `name`
+                description="Private message channel",
+                type=ChannelType.PM,
+            )
+            channel.channel_name = pm_name
+            logger.warning(f"[PM DEBUG] creating PM channel_name={pm_name!r} user_id={user_id} target_id={req.target_id}")
+            session.add(channel)
+            await session.commit()
+            await session.refresh(channel)
+            await session.refresh(target)
+            await session.refresh(current_user)
 
     await server.batch_join_channel([target, current_user], channel)
     channel_resp = await ChatChannelModel.transform(

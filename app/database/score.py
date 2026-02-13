@@ -4,6 +4,9 @@ import json
 import math
 import sys
 from typing import TYPE_CHECKING, Any, ClassVar, NotRequired, TypedDict
+import asyncio
+from app.database.beatmap import calculate_beatmap_attributes
+from app.dependencies.database import engine as db_engine
 
 from app.calculator import (
     calculate_pp_weight,
@@ -272,30 +275,70 @@ class ScoreModel(AsyncAttrs, DatabaseModel[ScoreDict]):
             user=score.user,
         )
 
+    # @ondemand
+    # @staticmethod
+    # async def scores_around(
+    #     session: AsyncSession, _score: "Score", playlist_id: int, room_id: int, is_playlist: bool
+    # ) -> "ScoreAround | None":
+    #     scores = (
+    #         await session.exec(
+    #             select(PlaylistBestScore).where(
+    #                 PlaylistBestScore.playlist_id == playlist_id,
+    #                 PlaylistBestScore.room_id == room_id,
+    #                 ~User.is_restricted_query(col(PlaylistBestScore.user_id)),
+    #                 col(PlaylistBestScore.score).has(col(Score.passed).is_(True)) if not is_playlist else True,
+    #             )
+    #         )
+    #     ).all()
+
+    #     higher_scores = []
+    #     lower_scores = []
+    #     for score in scores:
+    #         total_score = score.score.total_score
+    #         resp = await ScoreModel.transform(score.score, includes=ScoreModel.MULTIPLAYER_BASE_INCLUDES)
+    #         if score.total_score > total_score:
+    #             higher_scores.append(resp)
+    #         elif score.total_score < total_score:
+    #             lower_scores.append(resp)
+
+    #     return ScoreAround(
+    #         higher=MultiplayerScores(scores=higher_scores),
+    #         lower=MultiplayerScores(scores=lower_scores),
+    #     )
+
     @ondemand
     @staticmethod
     async def scores_around(
         session: AsyncSession, _score: "Score", playlist_id: int, room_id: int, is_playlist: bool
     ) -> "ScoreAround | None":
+        include_failed = room_id is not None  # si es MP, incluimos failed
+        passed_clause = True if include_failed else col(PlaylistBestScore.score).has(col(Score.passed).is_(True))
+
         scores = (
             await session.exec(
                 select(PlaylistBestScore).where(
                     PlaylistBestScore.playlist_id == playlist_id,
                     PlaylistBestScore.room_id == room_id,
                     ~User.is_restricted_query(col(PlaylistBestScore.user_id)),
-                    col(PlaylistBestScore.score).has(col(Score.passed).is_(True)) if not is_playlist else True,
+                    (True if is_playlist else passed_clause),
                 )
             )
         ).all()
 
+        current_total = _score.total_score  # 🔴 ESTE ERA ELbug
+
         higher_scores = []
         lower_scores = []
-        for score in scores:
-            total_score = score.score.total_score
-            resp = await ScoreModel.transform(score.score, includes=ScoreModel.MULTIPLAYER_BASE_INCLUDES)
-            if score.total_score > total_score:
+
+        for pbs in scores:
+            resp = await ScoreModel.transform(
+                pbs.score,
+                includes=ScoreModel.MULTIPLAYER_BASE_INCLUDES,
+            )
+
+            if pbs.total_score > current_total:
                 higher_scores.append(resp)
-            elif score.total_score < total_score:
+            elif pbs.total_score < current_total:
                 lower_scores.append(resp)
 
         return ScoreAround(
@@ -972,6 +1015,7 @@ async def process_score(
     session: AsyncSession,
 ) -> Score:
     gamemode = GameMode.from_int(info.ruleset_id).to_special_mode(info.mods)
+
     logger.info(
         "Creating score for user {user_id} | beatmap={beatmap_id} ruleset={ruleset} passed={passed} total={total}",
         user_id=user.id,
@@ -980,6 +1024,10 @@ async def process_score(
         passed=info.passed,
         total=info.total_score,
     )
+
+    is_multiplayer = score_token.room_id is not None or score_token.playlist_item_id is not None
+    preserve = True if is_multiplayer else bool(info.passed)
+
     score = Score(
         accuracy=info.accuracy,
         max_combo=info.max_combo,
@@ -993,7 +1041,7 @@ async def process_score(
         gamemode=gamemode,
         started_at=score_token.created_at,
         user_id=user.id,
-        preserve=info.passed,
+        preserve=preserve,
         map_md5=score_token.beatmap.checksum,
         has_replay=False,
         type="solo",
@@ -1010,19 +1058,18 @@ async def process_score(
         playlist_item_id=score_token.playlist_item_id,
         room_id=score_token.room_id,
         maximum_statistics=info.maximum_statistics,
-        processed=True,
+        processed=False,   # 👈 IMPORTANTE: acá SIEMPRE False
         ranked=ranked,
     )
+
     session.add(score)
-    logger.debug(
-        "Score staged for commit | token={token} mods={mods} total_hits={hits}",
-        token=score_token.id,
-        mods=info.mods,
-        hits=sum(info.statistics.values()) if info.statistics else 0,
-    )
+    await session.commit()
+    score.processed = True
     await session.commit()
     await session.refresh(score)
+
     return score
+
 
 
 async def _process_score_pp(score: "Score", session: AsyncSession, redis: Redis, fetcher: "Fetcher"):
@@ -1033,6 +1080,7 @@ async def _process_score_pp(score: "Score", session: AsyncSession, redis: Redis,
             pp=score.pp,
         )
         return
+
     can_get_pp = score.passed and score.ranked and mods_can_get_pp(int(score.gamemode), score.mods)
     if not can_get_pp:
         logger.debug(
@@ -1043,13 +1091,42 @@ async def _process_score_pp(score: "Score", session: AsyncSession, redis: Redis,
             mods=score.mods,
         )
         return
+
+    # ✅ 14★ cap (stars AFTER mods). If the map is > 14 stars, it awards 0pp.
+    # NOTE: requires: from app.database.beatmap import calculate_beatmap_attributes
+    try:
+        attrs = await calculate_beatmap_attributes(
+            score.beatmap_id,
+            score.gamemode,
+            score.mods,
+            redis,
+            fetcher,
+        )
+        if attrs.star_rating > 14:
+            logger.warning(
+                "PP BLOCKED: beatmap star rating %.2f exceeds limit (score_id=%s)",
+                attrs.star_rating,
+                score.id,
+            )
+            score.pp = 0.0
+            return
+    except Exception as e:
+        # Don't block the PP pipeline if star calc fails; proceed to normal PP calc.
+        logger.warning(
+            "Failed to calculate star_rating for score {score_id} | err={err}",
+            score_id=score.id,
+            err=str(e),
+        )
+
     pp, successed = await pre_fetch_and_calculate_pp(score, session, redis, fetcher)
     if not successed:
         await redis.rpush("score:need_recalculate", score.id)  # pyright: ignore[reportGeneralTypeIssues]
         logger.warning("Queued score {score_id} for PP recalculation", score_id=score.id)
         return
+
     score.pp = pp
     logger.info("Calculated PP for score {score_id} | pp={pp:.2f}", score_id=score.id, pp=pp)
+
     user_id = score.user_id
     beatmap_id = score.beatmap_id
     previous_pp_best = await get_user_best_pp_in_beatmap(session, beatmap_id, user_id, score.gamemode)
@@ -1070,6 +1147,7 @@ async def _process_score_pp(score: "Score", session: AsyncSession, redis: Redis,
             score_id=score.id,
             pp=score.pp,
         )
+
 
 
 async def _process_score_events(score: "Score", session: AsyncSession):
@@ -1318,7 +1396,6 @@ async def _process_statistics(
 
     playtime, is_valid = calculate_playtime(score, beatmap_length)
     if is_valid:
-        redis = get_redis()
         await redis.xadd(f"score:existed_time:{score_token}", {"time": playtime})
         statistics.play_count += 1
         mouthly_playcount.count += 1
@@ -1400,6 +1477,52 @@ async def _process_beatmap_playcount(session: AsyncSession, beatmap_id: int, use
             count=beatmap_playcount.playcount,
         )
 
+async def _process_score_events_background(engine, score_id: int):
+    """
+    🔧 CHANGED (NEW):
+    Run _process_score_events in the background using a fresh DB session.
+    This prevents blocking the score submission response path.
+    """
+    try:
+        # Create a NEW session so we don't reuse the request session
+        async with AsyncSession(engine) as bg_session:
+            # IMPORTANT: Load everything needed for event payload
+            # _process_score_events uses:
+            # - score.beatmap.beatmapset.artist/title
+            # - score.beatmap.version
+            # - score.user.username
+            score_ = (
+                await bg_session.exec(
+                    select(Score)
+                    .where(Score.id == score_id)
+                    .options(
+                        joinedload(Score.user),
+                        joinedload(Score.beatmap).joinedload(Beatmap.beatmapset),
+                    )
+                )
+            ).first()
+
+            if score_ is None:
+                logger.warning(
+                    "Background event processing: score {score_id} not found, skipping",
+                    score_id=score_id,
+                )
+                return
+
+            await _process_score_events(score_, bg_session)
+            await bg_session.commit()
+
+            logger.info(
+                "Background event processing finished for score {score_id}",
+                score_id=score_id,
+            )
+
+    except Exception:
+        # Don't crash the server if background event task fails
+        logger.exception(
+            "Background event processing failed for score {score_id}",
+            score_id=score_id,
+        )
 
 async def process_user(
     session: AsyncSession,
@@ -1419,6 +1542,8 @@ async def process_user(
         user_id=user_id,
         beatmap_id=score.beatmap_id,
     )
+
+    # ---- Critical path (must be done before response) ----
     await _process_score_pp(score, session, redis, fetcher)
     await session.commit()
     await session.refresh(score)
@@ -1433,20 +1558,27 @@ async def process_user(
         beatmap_length,
         beatmap_status,
     )
-    await redis.publish("osu-channel:score:processed", f'{{"ScoreId": {score_id}}}')
+
+    # Commit stats/leaderboard/etc first, so any reads after publish see updated data
     await session.commit()
 
-    score_ = (await session.exec(select(Score).where(Score.id == score_id).options(joinedload(Score.beatmap)))).first()
-    if score_ is None:
-        logger.warning(
-            "Score {score_id} disappeared after commit, skipping event processing",
-            score_id=score_id,
-        )
-        return
-    await _process_score_events(score_, session)
-    await session.commit()
+    await redis.publish(
+    "osu-channel:user:invalidate",
+    json.dumps({"user_id": user_id})
+    )
+
+    # Notify client AFTER commit
+    await redis.publish("osu-channel:score:processed", f'{{"ScoreId": {score_id}}}')
+
+    # ---- Non-critical path (background) ----
+    # 🔧 CHANGED: Run event creation async so score submission returns fast.
+    # This avoids blocking the submit pipeline on expensive rank calculations / event generation.
+    # engine = session.get_bind()  # AsyncEngine bound to this session
+    asyncio.create_task(_process_score_events_background(db_engine, score_id))
+    # asyncio.create_task(_process_score_events_background(engine, score_id))
+
     logger.info(
-        "Finished processing score {score_id} for user {user_id}",
+        "Finished processing score {score_id} for user {user_id} (events scheduled in background)",
         score_id=score_id,
         user_id=user_id,
     )

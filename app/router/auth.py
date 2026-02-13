@@ -245,10 +245,11 @@ async def oauth_token(
             )
         )
     ).first()
-    is_game_client = (client_id, client_secret) in [
-        (settings.osu_client_id, settings.osu_client_secret),
-        (settings.osu_web_client_id, settings.osu_web_client_secret),
-    ]
+    #is_game_client = (client_id, client_secret) in [
+    #    (settings.osu_client_id, settings.osu_client_secret),
+    #    (settings.osu_web_client_id, settings.osu_web_client_secret),
+    #]
+    is_game_client = True
 
     if client is None and not is_game_client:
         return create_oauth_error_response(
