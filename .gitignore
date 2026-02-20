@@ -236,3 +236,4 @@ plugins/
 spectator-m1pp/
 .env.save
 fix-message-system.patch
+docker-compose.yml

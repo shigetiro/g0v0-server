@@ -36,6 +36,12 @@ from fastapi.responses import RedirectResponse
 from httpx import HTTPError
 from sqlmodel import select
 
+from fastapi.responses import StreamingResponse
+import httpx
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @router.get(
     "/beatmapsets/search",
@@ -181,40 +187,72 @@ async def get_beatmapset(
         raise HTTPException(status_code=404, detail="Beatmapset not found") from exc
 
 
-@router.get(
-    "/beatmapsets/{beatmapset_id}/download",
-    tags=["谱面集"],
-    name="下载谱面集",
-    description="\n下载谱面集文件。基于请求IP地理位置智能分流，支持负载均衡和自动故障转移。中国IP使用Sayobot镜像，其他地区使用Nerinyan和OsuDirect镜像。",
-)
+@router.get("/beatmapsets/{beatmapset_id}/download", tags=["谱面集"])
 async def download_beatmapset(
     client_ip: IPAddress,
     beatmapset_id: Annotated[int, Path(..., description="谱面集 ID")],
     current_user: ClientUser,
     download_service: DownloadService,
-    no_video: Annotated[bool, Query(alias="noVideo", description="是否下载无视频版本")] = True,
+    no_video: Annotated[bool, Query(alias="noVideo")] = True,
 ):
     geoip_helper = get_geoip_helper()
     geo_info = geoip_helper.lookup(client_ip)
     country_code = geo_info.get("country_iso", "")
-
-    # 优先使用IP地理位置判断，如果获取失败则回退到用户账户的国家代码
     is_china = country_code == "CN" or (not country_code and current_user.country_code == "CN")
 
-    try:
-        # 使用负载均衡服务获取下载URL
-        download_url = download_service.get_download_url(
-            beatmapset_id=beatmapset_id, no_video=no_video, is_china=is_china
-        )
-        return RedirectResponse(download_url)
-    except HTTPException:
-        # 如果负载均衡服务失败，回退到原有逻辑
-        if is_china:
-            return RedirectResponse(
-                f"https://dl.sayobot.cn/beatmaps/download/{'novideo' if no_video else 'full'}/{beatmapset_id}"
-            )
-        else:
-            return RedirectResponse(f"https://catboy.best/d/{beatmapset_id}{'n' if no_video else ''}")
+    download_urls = download_service.get_download_urls(
+        beatmapset_id=beatmapset_id, no_video=no_video, is_china=is_china
+    )
+
+    if not download_urls:
+        raise HTTPException(status_code=503, detail="No download URLs available")
+
+    async def iterate_mirrors():
+        timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+            last_err = None
+            for url in download_urls:
+                try:
+                    logger.info(f"[beatmap dl] try {beatmapset_id} from {url}")
+                    async with client.stream("GET", url) as r:
+                        if r.status_code != 200:
+                            logger.warning(f"[beatmap dl] {url} -> {r.status_code}")
+                            continue
+
+                        # Read first chunk to validate ZIP (OSZ)
+                        first = b""
+                        async for chunk in r.aiter_bytes(chunk_size=65536):
+                            first = chunk
+                            break
+
+                        if not first:
+                            logger.warning(f"[beatmap dl] {url} empty body")
+                            continue
+
+                        # ZIP magic check
+                        if not first.startswith(b"PK"):
+                            ct = r.headers.get("Content-Type", "")
+                            logger.warning(f"[beatmap dl] {url} not zip (ct={ct}), skipping")
+                            continue
+
+                        # Yield first chunk then rest
+                        yield first
+                        async for chunk in r.aiter_bytes(chunk_size=65536):
+                            yield chunk
+                        return  # success, stop trying mirrors
+
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"[beatmap dl] {url} failed: {e}")
+                    continue
+
+            logger.error(f"[beatmap dl] all mirrors failed for {beatmapset_id}: {last_err}")
+
+    return StreamingResponse(
+        iterate_mirrors(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{beatmapset_id}.osz"'},
+    )
 
 
 @router.post(
