@@ -11,7 +11,6 @@ from app.calculators.performance import PerformanceCalculator
 from app.config import settings
 from app.const import MAX_SCORE
 from app.dependencies.storage import get_storage_service
-from app.database.beatmap import Beatmap
 from app.log import log
 from app.models.score import GameMode, HitResult, ScoreStatistics
 from app.models.scoring_mode import ScoringMode
@@ -194,6 +193,7 @@ async def pre_fetch_and_calculate_pp(
     # with upstream osu! beatmaps that can produce incorrect PP values.
     beatmap_raw: str | None = None
     try:
+        from app.database.beatmap import Beatmap
         beatmap = await session.get(Beatmap, beatmap_id)
         if beatmap and beatmap.is_local:
             cache_key = f"beatmap:{beatmap_id}:raw"
