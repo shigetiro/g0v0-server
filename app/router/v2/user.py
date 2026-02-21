@@ -47,6 +47,12 @@ def _get_difficulty_reduction_mods() -> set[str]:
     return mods
 
 
+def _normalize_user_mode(mode: GameMode | None) -> GameMode | None:
+    if mode == GameMode.FRUITSRX:
+        return GameMode.FRUITS
+    return mode
+
+
 async def visible_to_current_user(user: User, current_user: User | None, session: Database) -> bool:
     if user.id == BANCHOBOT_ID:
         return False
@@ -321,6 +327,7 @@ async def get_user_info_ruleset(
     ruleset: Annotated[GameMode | None, Path(description="指定 ruleset")],
     current_user: User | None = Security(get_optional_user, scopes=["public"]),
 ):
+    ruleset = _normalize_user_mode(ruleset)
     redis = get_redis()
     cache_service = get_user_cache_service(redis)
 
@@ -613,7 +620,7 @@ async def get_user_scores(
     if db_user is None or not await visible_to_current_user(db_user, current_user, session):
         raise HTTPException(404, detail="User not found")
 
-    gamemode = mode or db_user.playmode
+    gamemode = _normalize_user_mode(mode) or db_user.playmode
     where_clause = (col(Score.user_id) == db_user.id) & (col(Score.gamemode) == gamemode)
     includes = Score.USER_PROFILE_INCLUDES.copy()
     if not include_fails:

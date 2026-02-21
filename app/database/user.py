@@ -637,6 +637,9 @@ class UserModel(DatabaseModel[UserDict]):
         stats = await obj.awaitable_attrs.statistics
         result: dict[str, UserStatisticsDict] = {}
         for stat in stats:
+            # Torii behavior: merge catch relax into base catch profile mode.
+            if stat.mode == GameMode.FRUITSRX:
+                continue
             result[stat.mode.value] = await UserStatisticsModel.transform(
                 stat, user_country=obj.country_code, includes=includes
             )

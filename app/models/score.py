@@ -91,7 +91,8 @@ class GameMode(str, Enum):
             4: GameMode.OSURX,
             5: GameMode.OSUAP,
             6: GameMode.TAIKORX,
-            7: GameMode.FRUITSRX,
+            # Torii behavior: CTB relax is merged into base CTB mode.
+            7: GameMode.FRUITS,
         }.get(v)
         return gamemode or cls.from_int(v)
 
@@ -148,7 +149,8 @@ class GameMode(str, Enum):
             return {
                 GameMode.OSU: GameMode.OSURX,
                 GameMode.TAIKO: GameMode.TAIKORX,
-                GameMode.FRUITS: GameMode.FRUITSRX,
+                # Torii behavior: CTB relax is stored in base CTB mode.
+                GameMode.FRUITS: GameMode.FRUITS,
             }[self]
         return self
 
