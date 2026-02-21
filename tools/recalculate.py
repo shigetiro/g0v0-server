@@ -5,13 +5,16 @@ import asyncio
 from collections.abc import Awaitable, Sequence
 import contextlib
 import csv
+from io import BytesIO
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
+import re
 import sys
 import warnings
+import zipfile
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -25,6 +28,7 @@ from app.database.best_scores import BestScore
 from app.database.score import Score, calculate_playtime, calculate_user_pp
 from app.dependencies.database import engine, get_redis
 from app.dependencies.fetcher import get_fetcher
+from app.dependencies.storage import get_storage_service
 from app.fetcher import Fetcher
 from app.fetcher.beatmap_raw import NoBeatmapError
 from app.log import log
@@ -40,6 +44,42 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 logger = log("Recalculate")
 
 warnings.filterwarnings("ignore")
+
+
+async def _get_beatmap_raw_for_recalc(fetcher: Fetcher, redis: Redis, beatmap: Beatmap) -> str:
+    if not beatmap.is_local:
+        return await fetcher.get_or_fetch_beatmap_raw(redis, beatmap.id)
+
+    cache_key = f"beatmap:{beatmap.id}:raw"
+    if await redis.exists(cache_key):
+        cached = await redis.get(cache_key)
+        if cached:
+            return cached
+
+    storage = get_storage_service()
+    osz_path = f"beatmapsets/{beatmap.beatmapset_id}.osz"
+    if not await storage.is_exists(osz_path):
+        return await fetcher.get_or_fetch_beatmap_raw(redis, beatmap.id)
+
+    osz_bytes = await storage.read_file(osz_path)
+    chosen: str | None = None
+    with zipfile.ZipFile(BytesIO(osz_bytes)) as zf:
+        osu_files = [name for name in zf.namelist() if name.endswith(".osu")]
+        for name in osu_files:
+            text = zf.read(name).decode("utf-8", errors="ignore")
+            if re.search(rf"(?m)^BeatmapID\s*:\s*{beatmap.id}\s*$", text):
+                chosen = text
+                break
+            if beatmap.version and re.search(rf"(?m)^Version\s*:\s*{re.escape(beatmap.version)}\s*$", text):
+                chosen = text
+        if chosen is None and osu_files:
+            chosen = zf.read(osu_files[0]).decode("utf-8", errors="ignore")
+
+    if chosen:
+        cache_expire = settings.beatmap_cache_expire_hours * 60 * 60
+        await redis.set(cache_key, chosen, ex=cache_expire)
+        return chosen
+    return await fetcher.get_or_fetch_beatmap_raw(redis, beatmap.id)
 
 
 class BeatmapCacheManager:
@@ -651,7 +691,7 @@ async def recalc_score_pp(
             return 0.0
 
         try:
-            beatmap_raw = await fetcher.get_or_fetch_beatmap_raw(redis, score.beatmap_id)
+            beatmap_raw = await _get_beatmap_raw_for_recalc(fetcher, redis, beatmap)
             # 记录使用的beatmap
             if cache_manager:
                 await cache_manager.add_beatmap(score.beatmap_id)
