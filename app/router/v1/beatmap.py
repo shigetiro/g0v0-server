@@ -8,7 +8,7 @@ from app.database.favourite_beatmapset import FavouriteBeatmapset
 from app.database.score import Score
 from app.dependencies.database import Database, Redis
 from app.dependencies.fetcher import Fetcher
-from app.models.beatmap import BeatmapRankStatus, Genre, Language
+from app.models.beatmap import BeatmapRankStatus, Genre, Language, effective_rank_status
 from app.models.mods import int_to_mods
 from app.models.performance import OsuDifficultyAttributes
 from app.models.score import GameMode
@@ -72,7 +72,7 @@ class V1Beatmap(AllStrModel):
         diff_speed: float | None = None,
     ) -> "V1Beatmap":
         return cls(
-            approved=db_beatmap.beatmap_status,
+            approved=effective_rank_status(db_beatmap.beatmap_status),
             submit_date=db_beatmap.beatmapset.submitted_date,
             approved_date=db_beatmap.beatmapset.ranked_date,
             last_update=db_beatmap.last_updated,

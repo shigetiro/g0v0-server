@@ -31,13 +31,17 @@ class BeatmapsetCacheService:
         self.redis = redis
         self._default_ttl = settings.beatmapset_cache_expire_seconds
 
+    def _status_cache_scope(self) -> str:
+        all_lb = int(bool(settings.enable_all_beatmap_leaderboard))
+        all_pp = int(bool(settings.enable_all_beatmap_pp))
+        return f"alllb{all_lb}:allpp{all_pp}"
+
     def _get_beatmapset_cache_key(self, beatmapset_id: int) -> str:
-        """生成beatmapset缓存键"""
-        return f"beatmapset:{beatmapset_id}"
+        return f"beatmapset:{self._status_cache_scope()}:{beatmapset_id}"
 
     def _get_beatmap_lookup_cache_key(self, beatmap_id: int) -> str:
         """生成beatmap lookup缓存键"""
-        return f"beatmap_lookup:{beatmap_id}:beatmapset"
+        return f"beatmap_lookup:{self._status_cache_scope()}:{beatmap_id}:beatmapset"
 
     def _get_search_cache_key(self, query_hash: str, cursor_hash: str) -> str:
         """生成搜索结果缓存键"""
@@ -180,3 +184,4 @@ def get_beatmapset_cache_service(redis: Redis) -> BeatmapsetCacheService:
     if _cache_service is None:
         _cache_service = BeatmapsetCacheService(redis)
     return _cache_service
+
