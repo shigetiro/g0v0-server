@@ -30,6 +30,7 @@ import json
 import httpx
 from fastapi import HTTPException, Query, Security
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import or_ as sql_or
 from sqlmodel import col, func, select
 
@@ -130,7 +131,8 @@ class UserUpdateRequest(BaseModel):
     is_qat: bool | None = None
     is_gmt: bool | None = None
     is_admin: bool | None = None
-    badge: dict | str | None = None
+    # Accept legacy payloads from older frontend builds (dict/str/list)
+    badge: dict | str | list[dict] | None = None
 
 
 class BeatmapBlacklistItem(BaseModel):
@@ -591,10 +593,28 @@ async def update_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     if user_data.username is not None:
-        user.username = user_data.username
+        normalized_username = user_data.username.strip()
+        if not normalized_username:
+            raise HTTPException(status_code=422, detail="username cannot be empty")
+
+        # Avoid uniqueness crashes and return clean validation error.
+        existing_user = (
+            await session.exec(
+                select(User.id).where(
+                    col(User.username) == normalized_username,
+                    User.id != user_id,
+                ).limit(1)
+            )
+        ).first()
+        if existing_user is not None:
+            raise HTTPException(status_code=422, detail="username is already in use")
+
+        if normalized_username != user.username:
+            user.username = normalized_username
 
     if user_data.country_code is not None:
-        user.country_code = user_data.country_code
+        normalized_country = user_data.country_code.strip().upper()
+        user.country_code = normalized_country if normalized_country else None
 
     if user_data.is_qat is not None:
         user.is_qat = user_data.is_qat
@@ -658,10 +678,41 @@ async def update_user(
             }
             # Note: We store as dict with string dates for JSON compatibility, not Badge TypedDict with datetime
             user.badges = cast(Any, [badge_dict])
+        elif isinstance(user_data.badge, list):
+            # Legacy frontend may send a list of badge dicts. Keep only JSON-safe dict entries.
+            safe_badges: list[dict[str, Any]] = []
+            for entry in user_data.badge:
+                if not isinstance(entry, dict):
+                    continue
+                awarded_at = entry.get("awarded_at")
+                if isinstance(awarded_at, datetime):
+                    awarded_at = awarded_at.isoformat()
+                elif not isinstance(awarded_at, str):
+                    awarded_at = datetime.now().isoformat()
+
+                safe_badges.append(
+                    {
+                        "awarded_at": awarded_at,
+                        "description": entry.get("description", ""),
+                        "image_url": entry.get("icon_url") or entry.get("image_url", ""),
+                        "image@2x_url": entry.get("image@2x_url")
+                        or entry.get("icon_url")
+                        or entry.get("image_url", ""),
+                        "url": entry.get("url", ""),
+                    }
+                )
+            user.badges = cast(Any, safe_badges)
         else:
             user.badges = []
 
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        error_text = str(exc.orig).lower() if exc.orig else str(exc).lower()
+        if "username" in error_text and "duplicate" in error_text:
+            raise HTTPException(status_code=422, detail="username is already in use")
+        raise HTTPException(status_code=422, detail="invalid user update payload")
     await session.refresh(user)
     return await user_to_dict(user, session)
 
@@ -1198,13 +1249,17 @@ async def get_user_badges(
     """Get all badges from user_badges table (admin only)"""
     await require_admin(session, user_and_token)
 
-    # Join with User to get username
-    statement = (
-        select(UserBadge, User.username)
-        .outerjoin(User, col(UserBadge.user_id) == User.id)
-        .order_by(col(UserBadge.id).desc())
-    )
-    results = (await session.exec(statement)).all()
+    try:
+        # Join with User to get username
+        statement = (
+            select(UserBadge, User.username)
+            .outerjoin(User, col(UserBadge.user_id) == User.id)
+            .order_by(col(UserBadge.id).desc())
+        )
+        results = (await session.exec(statement)).all()
+    except Exception:
+        # Keep admin page usable even if table/schema is missing in a partially migrated environment.
+        return []
 
     badges = []
     for badge, username in results:
