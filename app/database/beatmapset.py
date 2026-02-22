@@ -7,7 +7,7 @@ from app.models.score import GameMode
 
 from ._base import DatabaseModel, OnDemand, included, ondemand
 from .beatmap_playcounts import BeatmapPlaycounts
-from .user import User, UserDict
+from .user import User, UserDict, UserModel
 
 from pydantic import BaseModel, field_validator, ConfigDict
 from sqlalchemy import JSON, Boolean, Column, DateTime, Text
@@ -408,7 +408,7 @@ class BeatmapsetModel(DatabaseModel[BeatmapsetDict]):
             if favourite_user is None:
                 # Defensive: data may contain orphaned favourites pointing to deleted users.
                 continue
-            users.append(await User.transform(favourite_user, includes=User.CARD_INCLUDES))
+            users.append(await UserModel.transform(favourite_user, includes=UserModel.CARD_INCLUDES))
         return users
 
     @ondemand
