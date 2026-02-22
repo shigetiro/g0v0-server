@@ -402,13 +402,14 @@ class BeatmapsetModel(DatabaseModel[BeatmapsetDict]):
                 .limit(50)
             )
         ).all()
-        return [
-            await User.transform(
-                (await favourite.awaitable_attrs.user),
-                includes=includes,
-            )
-            for favourite in recent_favourites
-        ]
+        users: list[UserDict] = []
+        for favourite in recent_favourites:
+            favourite_user = await favourite.awaitable_attrs.user
+            if favourite_user is None:
+                # Defensive: data may contain orphaned favourites pointing to deleted users.
+                continue
+            users.append(await User.transform(favourite_user, includes=includes))
+        return users
 
     @ondemand
     @staticmethod
