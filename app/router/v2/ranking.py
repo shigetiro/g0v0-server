@@ -69,7 +69,12 @@ async def _apply_nsfw_policy_to_rankings(
             user["avatar_url"] = avatar_url
             if cover:
                 user["cover"] = dict(cover)
-                user["cover_url"] = str(cover.get("url") or user.get("cover_url") or "")
+                user["cover_url"] = str(
+                    cover.get("url")
+                    or cover.get("custom_url")
+                    or user.get("cover_url")
+                    or ""
+                )
             user["avatar_nsfw"] = avatar_nsfw
             user["cover_nsfw"] = cover_nsfw
         row["user"] = user if show_nsfw_media else UserModel.apply_nsfw_media_policy(user, show_nsfw_media)

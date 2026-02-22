@@ -613,7 +613,11 @@ class UserModel(DatabaseModel[UserDict]):
     ) -> str:
         if obj.cover_nsfw and not show_nsfw_media:
             return UserModel.DEFAULT_COVER_URL
-        return obj.cover.get("url", "") if obj.cover else ""
+        if not obj.cover:
+            return ""
+        if isinstance(obj.cover, dict):
+            return str(obj.cover.get("url") or obj.cover.get("custom_url") or "")
+        return ""
 
     @ondemand
     @staticmethod
