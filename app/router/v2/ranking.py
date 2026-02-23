@@ -17,6 +17,18 @@ from pydantic import BaseModel, Field
 from sqlmodel import col, func, select
 
 
+def _looks_like_default_cover_url(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    if not normalized:
+        return False
+    if normalized == UserModel.DEFAULT_COVER_URL.lower():
+        return True
+    # Asset proxy may rewrite domain, keep path marker based detection.
+    return "/user-profile-covers/default.jpeg" in normalized or "/user-profile-covers/default.jpg" in normalized
+
+
 async def _apply_nsfw_policy_to_rankings(
     session: Database,
     ranking_rows: list[dict[str, Any]],
@@ -34,12 +46,12 @@ async def _apply_nsfw_policy_to_rankings(
         missing_flags = "avatar_nsfw" not in user or "cover_nsfw" not in user
         likely_sanitized = (
             user.get("avatar_url") == UserModel.DEFAULT_AVATAR_URL
-            or user.get("cover_url") == UserModel.DEFAULT_COVER_URL
+            or _looks_like_default_cover_url(user.get("cover_url"))
             or (
                 isinstance(user.get("cover"), dict)
                 and (
-                    user["cover"].get("url") == UserModel.DEFAULT_COVER_URL
-                    or user["cover"].get("custom_url") == UserModel.DEFAULT_COVER_URL
+                    _looks_like_default_cover_url(user["cover"].get("url"))
+                    or _looks_like_default_cover_url(user["cover"].get("custom_url"))
                 )
             )
         )
@@ -77,14 +89,34 @@ async def _apply_nsfw_policy_to_rankings(
             user["avatar_url"] = avatar_url
             if cover:
                 user["cover"] = dict(cover)
+                cover_url = str(cover.get("url") or "")
+                cover_custom_url = str(cover.get("custom_url") or "")
+                # Prefer non-default cover URL when both keys exist.
+                preferred_cover_url = (
+                    cover_url
+                    if cover_url and not _looks_like_default_cover_url(cover_url)
+                    else cover_custom_url
+                )
                 user["cover_url"] = str(
-                    cover.get("url")
-                    or cover.get("custom_url")
+                    preferred_cover_url
                     or user.get("cover_url")
                     or ""
                 )
             user["avatar_nsfw"] = avatar_nsfw
             user["cover_nsfw"] = cover_nsfw
+
+        # Fail-closed policy:
+        # If the viewer does not allow NSFW media and flags are missing for any reason
+        # (stale cache entry, transform mismatch, DB hydration edge case), mask media by default.
+        if not show_nsfw_media:
+            if "avatar_nsfw" not in user:
+                user["avatar_url"] = UserModel.DEFAULT_AVATAR_URL
+                user["avatar_nsfw"] = True
+            if "cover_nsfw" not in user:
+                user["cover_url"] = UserModel.DEFAULT_COVER_URL
+                user["cover"] = UserModel._masked_cover(user.get("cover"))
+                user["cover_nsfw"] = True
+
         row["user"] = user if show_nsfw_media else UserModel.apply_nsfw_media_policy(user, show_nsfw_media)
 
     return ranking_rows

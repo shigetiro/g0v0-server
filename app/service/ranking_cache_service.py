@@ -366,7 +366,12 @@ class RankingCacheService:
                     # 转换为响应格式并确保正确序列化
                     ranking_data = []
                     for statistics in statistics_data:
-                        user_stats_resp = await UserStatisticsModel.transform(statistics, includes=include)
+                        # Cache canonical payload (unmasked NSFW media); viewer policy is applied at request time.
+                        user_stats_resp = await UserStatisticsModel.transform(
+                            statistics,
+                            includes=include,
+                            show_nsfw_media=True,
+                        )
 
                         user_dict = user_stats_resp
 
