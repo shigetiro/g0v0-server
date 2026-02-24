@@ -1,4 +1,5 @@
 from app.config import settings
+from app.const import BANCHOBOT_ID
 from app.database.notification import Notification, UserNotification
 from app.database.user import User
 from app.dependencies.database import Database
@@ -58,7 +59,7 @@ async def get_notifications(
     source_user_ids = {
         n.notification.source_user_id
         for n in notifications
-        if n.notification.source_user_id > 0
+        if n.notification.source_user_id > 0 and n.notification.source_user_id != BANCHOBOT_ID
     }
     if source_user_ids:
         existing_user_ids = set(
@@ -66,7 +67,9 @@ async def get_notifications(
         )
         for user_notification in notifications:
             source_user_id = user_notification.notification.source_user_id
-            if source_user_id > 0 and source_user_id not in existing_user_ids:
+            if source_user_id == BANCHOBOT_ID:
+                user_notification.notification.source_user_id = 0
+            elif source_user_id > 0 and source_user_id not in existing_user_ids:
                 user_notification.notification.source_user_id = 0
 
     total_count = (
