@@ -52,6 +52,23 @@ async def get_notifications(
     if max_id is not None:
         query = query.where(UserNotification.notification_id < max_id)
     notifications = (await session.exec(query)).all()
+
+    # Normalize stale notifications that reference deleted users to avoid
+    # repeated client fetches to /api/v2/users/{missing_id}.
+    source_user_ids = {
+        n.notification.source_user_id
+        for n in notifications
+        if n.notification.source_user_id > 0
+    }
+    if source_user_ids:
+        existing_user_ids = set(
+            (await session.exec(select(User.id).where(col(User.id).in_(source_user_ids)))).all()
+        )
+        for user_notification in notifications:
+            source_user_id = user_notification.notification.source_user_id
+            if source_user_id > 0 and source_user_id not in existing_user_ids:
+                user_notification.notification.source_user_id = 0
+
     total_count = (
         await session.exec(
             select(func.count())
