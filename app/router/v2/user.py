@@ -35,7 +35,7 @@ from app.utils import api_doc, utcnow
 from .router import router
 
 from fastapi import BackgroundTasks, HTTPException, Path, Query, Request, Security
-from sqlmodel import exists, select, tuple_
+from sqlmodel import exists, func, select, tuple_
 from sqlmodel.sql.expression import col
 
 
@@ -499,10 +499,17 @@ async def get_user_beatmapsets(
             status_filters = []
 
         if status_filters:
+            owner_filter = (
+                (col(Beatmapset.is_local).is_(True) & (Beatmapset.user_id == user.id))
+                | (
+                    col(Beatmapset.is_local).is_not(True)
+                    & (func.lower(col(Beatmapset.creator)) == user.username.lower())
+                )
+            )
             stmt = (
                 select(Beatmapset)
                 .where(
-                    Beatmapset.user_id == user_id,
+                    owner_filter,
                     col(Beatmapset.beatmap_status).in_(status_filters),
                 )
                 .order_by(col(Beatmapset.last_updated).desc(), col(Beatmapset.id).desc())

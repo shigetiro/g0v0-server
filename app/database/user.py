@@ -388,12 +388,20 @@ class UserModel(DatabaseModel[UserDict]):
     async def graveyard_beatmapset_count(session: AsyncSession, obj: "User") -> int:
         from .beatmapset import Beatmapset
 
+        owner_filter = (
+            (col(Beatmapset.is_local).is_(True) & (Beatmapset.user_id == obj.id))
+            | (
+                col(Beatmapset.is_local).is_not(True)
+                & (func.lower(col(Beatmapset.creator)) == obj.username.lower())
+            )
+        )
+
         return (
             await session.exec(
                 select(func.count())
                 .select_from(Beatmapset)
                 .where(
-                    Beatmapset.user_id == obj.id,
+                    owner_filter,
                     Beatmapset.beatmap_status == BeatmapRankStatus.GRAVEYARD,
                 )
             )
@@ -404,12 +412,20 @@ class UserModel(DatabaseModel[UserDict]):
     async def loved_beatmapset_count(session: AsyncSession, obj: "User") -> int:
         from .beatmapset import Beatmapset
 
+        owner_filter = (
+            (col(Beatmapset.is_local).is_(True) & (Beatmapset.user_id == obj.id))
+            | (
+                col(Beatmapset.is_local).is_not(True)
+                & (func.lower(col(Beatmapset.creator)) == obj.username.lower())
+            )
+        )
+
         return (
             await session.exec(
                 select(func.count())
                 .select_from(Beatmapset)
                 .where(
-                    Beatmapset.user_id == obj.id,
+                    owner_filter,
                     Beatmapset.beatmap_status == BeatmapRankStatus.LOVED,
                 )
             )
@@ -435,12 +451,20 @@ class UserModel(DatabaseModel[UserDict]):
     async def pending_beatmapset_count(session: AsyncSession, obj: "User") -> int:
         from .beatmapset import Beatmapset
 
+        owner_filter = (
+            (col(Beatmapset.is_local).is_(True) & (Beatmapset.user_id == obj.id))
+            | (
+                col(Beatmapset.is_local).is_not(True)
+                & (func.lower(col(Beatmapset.creator)) == obj.username.lower())
+            )
+        )
+
         return (
             await session.exec(
                 select(func.count())
                 .select_from(Beatmapset)
                 .where(
-                    Beatmapset.user_id == obj.id,
+                    owner_filter,
                     col(Beatmapset.beatmap_status).in_(
                         [BeatmapRankStatus.WIP, BeatmapRankStatus.PENDING]
                     ),
@@ -453,12 +477,20 @@ class UserModel(DatabaseModel[UserDict]):
     async def ranked_beatmapset_count(session: AsyncSession, obj: "User") -> int:
         from .beatmapset import Beatmapset
 
+        owner_filter = (
+            (col(Beatmapset.is_local).is_(True) & (Beatmapset.user_id == obj.id))
+            | (
+                col(Beatmapset.is_local).is_not(True)
+                & (func.lower(col(Beatmapset.creator)) == obj.username.lower())
+            )
+        )
+
         return (
             await session.exec(
                 select(func.count())
                 .select_from(Beatmapset)
                 .where(
-                    Beatmapset.user_id == obj.id,
+                    owner_filter,
                     col(Beatmapset.beatmap_status).in_(
                         [
                             BeatmapRankStatus.RANKED,
