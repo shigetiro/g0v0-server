@@ -9,7 +9,7 @@ from app.database.chat import ChannelType, ChatChannel, ChatMessage, ChatMessage
 from app.database.score import Score
 from app.database.statistics import UserStatistics
 from app.database.daily_challenge_model import DailyChallenge, DailyChallengeCreate, DailyChallengeUpdate, DailyChallengeResponse
-from app.database.team import Team
+from app.database.team import Team, TeamMember
 from app.database.user import User
 from app.database.user_account_history import UserAccountHistory, UserAccountHistoryType
 from app.database.user_badge import UserBadge, UserBadgeCreate, UserBadgeUpdate, UserBadgeResponse
@@ -17,18 +17,22 @@ from app.database.verification import LoginSession, LoginSessionResp, TrustedDev
 from app.const import BANCHOBOT_ID
 from app.dependencies.database import Database, get_redis
 from app.dependencies.geoip import GeoIPService
+from app.dependencies.storage import StorageService
 from app.dependencies.user import UserAndToken, get_client_user_and_token
 from app.models.mods import APIMod, get_available_mods
+from app.models.score import GameMode
 from app.models.notification import ChannelMessage, GlobalAnnouncement
 from app.router.notification.server import server
+from app.service.ranking_cache_service import get_ranking_cache_service
 from app.tasks.daily_challenge import create_daily_challenge_room
-from app.utils import utcnow
+from app.utils import check_image, utcnow
 
 from .router import router
 
 import json
 import httpx
-from fastapi import HTTPException, Query, Security
+import hashlib
+from fastapi import File, Form, HTTPException, Query, Security
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import or_ as sql_or
@@ -71,7 +75,7 @@ async def user_to_dict(user: User, session: Database) -> dict:
     except Exception:
         user_dict["is_restricted"] = False
 
-    # Handle badges if needed - serialize datetime to ISO string
+    # Handle badges - serialize datetime to ISO string
     try:
         # 1. Get badges from JSON field (legacy)
         legacy_badges = []
@@ -85,7 +89,11 @@ async def user_to_dict(user: User, session: Database) -> dict:
 
         # 2. Get badges from user_badges table (new)
         db_badges = []
-        user_badges_list = await user.awaitable_attrs.user_badges
+        user_badges_list = (
+            await session.exec(
+                select(UserBadge).where(UserBadge.user_id == user.id).order_by(col(UserBadge.awarded_at).desc())
+            )
+        ).all()
         if user_badges_list:
             for badge in user_badges_list:
                 db_badges.append({
@@ -98,10 +106,9 @@ async def user_to_dict(user: User, session: Database) -> dict:
                     "user_id": badge.user_id
                 })
 
-        # Combine both, preferring DB badges (put them first or just combine)
+        # Combine both, preferring DB badges.
         user_dict["badges"] = db_badges + legacy_badges
-    except Exception as e:
-        print(f"Error serializing badges for user {user.id}: {e}")
+    except Exception:
         user_dict["badges"] = []
 
     return user_dict
@@ -123,6 +130,31 @@ class AdminStatsResp(BaseModel):
     blacklisted_beatmaps: int
     performance_server_status: str
     api_server_status: str
+
+
+async def _count_online_users(redis) -> int:
+    """Count online users with set-first strategy and SCAN fallback."""
+    try:
+        online_set_key = "metadata:online_users_set"
+        if await redis.exists(online_set_key):
+            return int(await redis.scard(online_set_key))
+    except Exception:
+        pass
+
+    try:
+        cursor = 0
+        online_count = 0
+        max_iterations = 500
+        iterations = 0
+        while True:
+            cursor, keys = await redis.scan(cursor, match="metadata:online:*", count=1000)
+            online_count += len(keys)
+            iterations += 1
+            if cursor == 0 or iterations >= max_iterations:
+                break
+        return online_count
+    except Exception:
+        return 0
 
 
 class UserUpdateRequest(BaseModel):
@@ -341,8 +373,7 @@ async def get_admin_stats(
 
     # Count online users
     redis = get_redis()
-    online_keys = await redis.keys("metadata:online:*")
-    online_users = len(online_keys)
+    online_users = await _count_online_users(redis)
 
     # Sum total PP
     total_pp = (await session.exec(select(func.sum(UserStatistics.pp)))).one() or 0.0
@@ -1394,17 +1425,112 @@ async def get_all_teams(
 async def update_team_admin(
     session: Database,
     team_id: int,
+    storage: StorageService,
     user_and_token: Annotated[UserAndToken, Security(get_client_user_and_token)],
+    flag: bytes | None = File(None),
+    cover: bytes | None = File(None),
+    name: str | None = Form(None, max_length=100),
+    short_name: str | None = Form(None, max_length=10),
+    leader_id: int | None = Form(None),
+    playmode: GameMode | None = Form(None),
+    description: str | None = Form(None, max_length=2000),
+    website: str | None = Form(None, max_length=255),
 ):
-    """Update team (admin only) - delegates to existing team update endpoint"""
+    """Update team (admin only)."""
     await require_admin(session, user_and_token)
 
-    # This should use the existing team update logic from team.py
-    # For now, return a message indicating to use the regular team endpoint
-    raise HTTPException(
-        status_code=501,
-        detail="Use /api/private/team/{team_id} endpoint for team updates. Admin override not yet implemented.",
-    )
+    team = await session.get(Team, team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    if name is not None:
+        clean_name = name.strip()
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Team name cannot be empty")
+        if (
+            await session.exec(
+                select(exists()).where(
+                    Team.name == clean_name,
+                    Team.id != team_id,
+                )
+            )
+        ).first():
+            raise HTTPException(status_code=409, detail="Name already exists")
+        team.name = clean_name
+
+    if short_name is not None:
+        clean_short_name = short_name.strip()
+        if not clean_short_name:
+            raise HTTPException(status_code=400, detail="Team short name cannot be empty")
+        if (
+            await session.exec(
+                select(exists()).where(
+                    Team.short_name == clean_short_name,
+                    Team.id != team_id,
+                )
+            )
+        ).first():
+            raise HTTPException(status_code=409, detail="Short name already exists")
+        team.short_name = clean_short_name
+
+    if playmode is not None:
+        team.playmode = playmode
+
+    if description is not None:
+        clean_description = description.strip()
+        team.description = clean_description or None
+
+    if website is not None:
+        clean_website = website.strip()
+        if clean_website and not (clean_website.startswith("http://") or clean_website.startswith("https://")):
+            clean_website = "https://" + clean_website
+        team.website = clean_website or None
+
+    if flag is not None:
+        fmt = check_image(flag, 2 * 1024 * 1024, 240, 120)
+        if old_flag := team.flag_url:
+            if path := storage.get_file_name_by_url(old_flag):
+                await storage.delete_file(path)
+        filehash = hashlib.sha256(flag).hexdigest()
+        storage_path = f"team_flag/{team.id}_{filehash}.png"
+        if not await storage.is_exists(storage_path):
+            await storage.write_file(storage_path, flag, f"image/{fmt}")
+        team.flag_url = await storage.get_file_url(storage_path)
+
+    if cover is not None:
+        fmt = check_image(cover, 10 * 1024 * 1024, 3000, 2000)
+        if old_cover := team.cover_url:
+            if path := storage.get_file_name_by_url(old_cover):
+                await storage.delete_file(path)
+        filehash = hashlib.sha256(cover).hexdigest()
+        storage_path = f"team_cover/{team.id}_{filehash}.png"
+        if not await storage.is_exists(storage_path):
+            await storage.write_file(storage_path, cover, f"image/{fmt}")
+        team.cover_url = await storage.get_file_url(storage_path)
+
+    if leader_id is not None:
+        if not (await session.exec(select(exists()).where(User.id == leader_id))).first():
+            raise HTTPException(status_code=404, detail="Leader not found")
+        is_member = (
+            await session.exec(
+                select(exists()).where(
+                    TeamMember.user_id == leader_id,
+                    TeamMember.team_id == team_id,
+                )
+            )
+        ).first()
+        if not is_member:
+            raise HTTPException(status_code=404, detail="Leader is not a member of the team")
+        team.leader_id = leader_id
+
+    await session.commit()
+    await session.refresh(team)
+
+    redis = get_redis()
+    cache_service = get_ranking_cache_service(redis)
+    await cache_service.invalidate_team_cache()
+
+    return team
 
 
 @router.delete(
