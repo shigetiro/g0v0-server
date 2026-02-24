@@ -419,8 +419,8 @@ async def chat_websocket(
                 await session.exec(
                     select(ChatChannel).where(
                         ChatChannel.type == ChannelType.PM,
-                        col(ChatChannel.name).like(f"pm\\_{user_id}\\_%", escape="\\")
-                        | col(ChatChannel.name).like(f"pm\\_%\\_{user_id}", escape="\\"),
+                        col(ChatChannel.channel_name).like(f"pm\\_{user_id}\\_%", escape="\\")
+                        | col(ChatChannel.channel_name).like(f"pm\\_%\\_{user_id}", escape="\\"),
                     )
                 )
             ).all()

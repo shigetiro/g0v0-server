@@ -192,7 +192,7 @@ async def api_get_player_info(
     session: Database,
     scope: Annotated[Literal["stats", "events", "info", "all"], Query(..., description="信息范围")],
     id: Annotated[int | None, Query(ge=3, le=2147483647, description="用户 ID")] = None,
-    name: Annotated[str | None, Query(regex=r"^[\w \[\]-]{2,32}$", description="用户名")] = None,
+    name: Annotated[str | None, Query(pattern=r"^[\w \[\]-]{2,32}$", description="用户名")] = None,
 ):
     """
     获取指定玩家的信息
