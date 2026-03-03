@@ -1,7 +1,7 @@
 from typing import Annotated, Literal
 
 from app.config import settings
-from app.database import Team, TeamMember, User, UserStatistics
+from app.database import Team, TeamMember, User, UserStatistics, BestScore, ScoreModel, Beatmap
 from app.database.statistics import UserStatisticsModel
 from app.dependencies.database import Database, get_redis
 from app.dependencies.user import get_current_user
@@ -308,6 +308,64 @@ async def get_country_ranking(
     # 返回当前页的结果
     response.ranking = current_page_data
     return response
+
+
+@router.get(
+    "/rankings/{ruleset}/top-plays",
+    name="获取顶级成绩排行榜",
+    description="获取指定模式下 PP 最高的成绩排行榜 (分页)",
+    tags=["排行榜"],
+)
+async def get_top_plays(
+    session: Database,
+    ruleset: Annotated[GameMode, Path(..., description="指定 ruleset")],
+    current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
+    page: Annotated[int, Query(ge=1, description="页码")] = 1,
+):
+    # 构建查询条件
+    wheres = [
+        col(BestScore.gamemode) == ruleset,
+        col(BestScore.pp) > 0,
+    ]
+
+    # 过滤受限用户
+    wheres.append(~User.is_restricted_query(col(BestScore.user_id)))
+
+    # 查询总数
+    count_query = select(func.count()).select_from(BestScore).where(*wheres)
+    total_count_result = await session.exec(count_query)
+    total_count = total_count_result.one()
+
+    # 查询顶级成绩
+    from sqlalchemy.orm import joinedload
+
+    stmt = (
+        select(BestScore)
+        .where(*wheres)
+        .order_by(col(BestScore.pp).desc())
+        .limit(50)
+        .offset(50 * (page - 1))
+        .options(
+            joinedload(BestScore.score),
+            joinedload(BestScore.user),
+            joinedload(BestScore.beatmap).joinedload(col(Beatmap.beatmapset)),
+        )
+    )
+
+    best_scores = (await session.exec(stmt)).all()
+
+    ranking_data = []
+    for bs in best_scores:
+        # 转换为响应格式
+        score_resp = await ScoreModel.transform(
+            bs.score, includes=["user.country", "user.cover", "beatmap", "beatmapset"]
+        )
+        ranking_data.append(score_resp)
+
+    return {
+        "ranking": ranking_data,
+        "total": total_count,
+    }
 
 
 @router.get(
