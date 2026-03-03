@@ -40,8 +40,42 @@ def download_achievement_images(achievements_path: Path) -> None:
             "nightcore",
             "halftime",
             "spunout",
+            "conversion",
+            "fun",
         ):
             images.append(f"all-intro-{mod}{resolution}.png")
+
+        for secret in (
+            "jackpot",
+            "nonstop",
+            "tidi",
+            "tothecore",
+            "when-you-see-it",
+            "prepared",
+            "reckless",
+            "lightsout",
+            "uguushy",
+            "nuked",
+            "hourbeforethedawn",
+            "slowandsteady",
+            "ntts",
+            "sognare",
+            "realtor",
+            "impeccable",
+            "aeon",
+            "quickmaffs",
+            "kaleidoscope",
+            "valediction",
+            "rightontime",
+            "notagain",
+            "deliberation",
+            "clarity",
+            "autocreation",
+            "identity",
+            "skinoftheteeth",
+            "meticulousmayhem",
+        ):
+            images.append(f"all-secret-{secret}{resolution}.png")
 
     base_url = "https://assets.ppy.sh/medals/client/"
 
