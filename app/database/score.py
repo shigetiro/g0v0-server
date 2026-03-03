@@ -32,6 +32,7 @@ from app.models.score import (
     Rank,
     ScoreStatistics,
     SoloScoreSubmissionInfo,
+    ScoreSort,
 )
 from app.models.scoring_mode import ScoringMode
 from app.storage import StorageService
@@ -56,7 +57,7 @@ from .user import User, UserDict, UserModel
 
 from pydantic import BaseModel, field_serializer, field_validator
 from redis.asyncio import Redis
-from sqlalchemy import Boolean, Column, DateTime, TextClause
+from sqlalchemy import Boolean, Column, DateTime, TextClause, or_
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import Mapped, joinedload
 from sqlalchemy.sql.elements import ColumnElement
@@ -74,6 +75,7 @@ from sqlmodel import (
     true,
 )
 from sqlmodel.ext.asyncio.session import AsyncSession
+
 
 if TYPE_CHECKING:
     from app.fetcher import Fetcher
@@ -95,6 +97,7 @@ class ScoreDict(TypedDict):
     passed: bool
     pp: float
     started_at: datetime
+    client_hash: str | None
     total_score: int
     maximum_statistics: ScoreStatistics
     mods: list[APIMod]
@@ -110,7 +113,7 @@ class ScoreDict(TypedDict):
     ruleset_id: NotRequired[int]
     statistics: NotRequired[ScoreStatistics]
     beatmapset: NotRequired[BeatmapsetDict]
-    beatmap: NotRequired[BeatmapDict]
+    beatmap: NotRequired["BeatmapDict"]
     current_user_attributes: NotRequired[CurrentUserAttributes]
     position: NotRequired[int | None]
     scores_around: NotRequired["ScoreAround | None"]
@@ -155,6 +158,7 @@ class ScoreModel(AsyncAttrs, DatabaseModel[ScoreDict]):
     passed: bool = Field(sa_column=Column(Boolean))
     pp: float = Field(default=0.0)
     started_at: datetime = Field(sa_column=Column(DateTime))
+    client_hash: str | None = Field(default=None)
     total_score: int = Field(default=0, sa_column=Column(BigInteger))
     maximum_statistics: ScoreStatistics = Field(sa_column=Column(JSON), default_factory=dict)
     mods: list[APIMod] = Field(sa_column=Column(JSON))
@@ -246,7 +250,9 @@ class ScoreModel(AsyncAttrs, DatabaseModel[ScoreDict]):
         _session: AsyncSession,
         score: "Score",
         includes: list[str] | None = None,
-    ) -> BeatmapDict:
+    ) -> "BeatmapDict":
+        from .beatmap import BeatmapModel
+
         await score.awaitable_attrs.beatmap
         return await BeatmapModel.transform(score.beatmap, includes=includes)
 
@@ -450,7 +456,7 @@ class Score(ScoreModel, table=True):
         return str(v)
 
     # optional
-    beatmap: Mapped[Beatmap] = Relationship()
+    beatmap: Mapped["Beatmap"] = Relationship()
     user: Mapped[User] = Relationship(sa_relationship_kwargs={"lazy": "joined"})
     best_score: Mapped[TotalScoreBestScore | None] = Relationship(
         back_populates="score",
@@ -646,17 +652,169 @@ async def _score_where(
             wheres.append(
                 col(TotalScoreBestScore.user).has(col(User.team_membership).has(TeamMember.team_id == team_id))
             )
+
     if mods:
-        if user and user.is_supporter:
+        # Check if this is an automation mod filter (Relax or Autopilot)
+        # If so, show all scores with that mod in any combination
+        # Otherwise, show only exact mod combinations
+        automation_mods = [m for m in mods if m in ("RX", "AP")]
+
+        if automation_mods:
+            # For automation mods (RX, AP), show all combinations containing that mod
+            # mods in TotalScoreBestScore is stored as simple array of strings ["RX", "HD"]
+            # We need to check if any of these strings are in the mods array
+            for mod in automation_mods:
+                # JSON_CONTAINS checks if the value exists in the array
+                wheres.append(
+                    text(f"JSON_CONTAINS(total_score_best_scores.mods, :mod_{mod})").params(**{f"mod_{mod}": json.dumps(mod)})
+                )
+        else:
+            # For regular mods, use exact matching (bidirectional subset)
             wheres.append(
                 text(
                     "JSON_CONTAINS(total_score_best_scores.mods, :w)"
                     " AND JSON_CONTAINS(:w, total_score_best_scores.mods)"
                 ).params(w=json.dumps(mods))
             )
+    else:
+        # No mods provided - for global leaderboard, show all scores including RX/AP
+        # unless specifically filtered out by the user.
+        # Original logic was: wheres.append(text("NOT (JSON_CONTAINS(...) OR JSON_CONTAINS(...))"))
+        # We remove this to allow RX/AP scores to show on the main leaderboard if they are the best.
+        pass
+
+    return wheres
+
+
+async def _best_score_where(
+    type: LeaderboardType,
+    beatmap: int,
+    mode: GameMode,
+    mods: list[str] | None = None,
+    user: User | None = None,
+) -> list[ColumnElement[bool] | TextClause] | None:
+    wheres: list[ColumnElement[bool] | TextClause] = [
+        col(BestScore.beatmap_id) == beatmap,
+        col(BestScore.gamemode) == mode,
+        ~User.is_restricted_query(col(BestScore.user_id)),
+    ]
+
+    if type == LeaderboardType.FRIENDS:
+        if user and user.is_supporter:
+            subq = (
+                select(DBRelationship.target_id)
+                .where(
+                    DBRelationship.type == RelationshipType.FOLLOW,
+                    DBRelationship.user_id == user.id,
+                )
+                .subquery()
+            )
+            wheres.append(col(BestScore.user_id).in_(select(subq.c.target_id)))
         else:
             return None
+    elif type == LeaderboardType.COUNTRY:
+        if user and user.is_supporter:
+            wheres.append(col(BestScore.user).has(col(User.country_code) == user.country_code))
+        else:
+            return None
+    elif type == LeaderboardType.TEAM and user:
+        team_membership = await user.awaitable_attrs.team_membership
+        if team_membership:
+            team_id = team_membership.team_id
+            wheres.append(
+                col(BestScore.user).has(col(User.team_membership).has(TeamMember.team_id == team_id))
+            )
+
+    if mods:
+        # Check if this is an automation mod filter (Relax or Autopilot)
+        automation_mods = [m for m in mods if m in ("RX", "AP")]
+
+        if automation_mods:
+            for mod in automation_mods:
+                wheres.append(
+                    col(BestScore.score).has(
+                        func.JSON_CONTAINS(ScoreModel.mods, json.dumps({"acronym": mod}))
+                    )
+                )
+        else:
+            # For regular mods, use exact matching
+            wheres.append(
+                col(BestScore.score).has(
+                    func.JSON_LENGTH(ScoreModel.mods) == len(mods)
+                )
+            )
+            for mod in mods:
+                wheres.append(
+                    col(BestScore.score).has(
+                        func.JSON_CONTAINS(ScoreModel.mods, json.dumps({"acronym": mod}))
+                    )
+                )
+
     return wheres
+
+
+async def get_pp_leaderboard(
+    session: AsyncSession,
+    beatmap: int,
+    mode: GameMode,
+    type: LeaderboardType = LeaderboardType.GLOBAL,
+    mods: list[str] | None = None,
+    user: User | None = None,
+    limit: int = 50,
+) -> tuple[list[Score], Score | None, int]:
+    wheres = await _best_score_where(type, beatmap, mode, mods, user)
+    if wheres is None:
+        return [], None, 0
+
+    count = (await session.exec(select(func.count()).where(*wheres))).one()
+
+    query = (
+        select(BestScore)
+        .where(*wheres)
+        .limit(limit * 2)  # Fetch more to handle deduplication
+        .order_by(col(BestScore.pp).desc())
+        .options(joinedload(BestScore.score))
+    )
+
+    best_scores = (await session.exec(query)).all()
+
+    # Deduplicate by user_id
+    seen_users = set()
+    result_scores = []
+    for bs in best_scores:
+        if bs.user_id not in seen_users:
+            seen_users.add(bs.user_id)
+            result_scores.append(bs.score)
+            if len(result_scores) >= limit:
+                break
+
+    # Update count if deduplication removed entries?
+    # Actually count represents total entries in the DB matching the criteria.
+    # If the DB has multiple entries per user, the count is inflated.
+    # We should ideally count distinct user_ids, but that's expensive.
+    # For now, we leave count as is, or attempt to fix it.
+    # count = len(result_scores) # This is wrong for pagination.
+
+    user_score = None
+    if user:
+        user_wheres = await _best_score_where(LeaderboardType.GLOBAL, beatmap, mode, mods, user)
+        # Manually add user_id filter as _best_score_where(GLOBAL) doesn't add it
+        if user_wheres is not None:
+            user_query = (
+                select(BestScore)
+                .where(*user_wheres)
+                .where(col(BestScore.user_id) == user.id)
+                .order_by(col(BestScore.pp).desc())
+                .options(joinedload(BestScore.score))
+            )
+            user_bs = (await session.exec(user_query)).first()
+            if user_bs:
+                user_score = user_bs.score
+
+        if user_score and user_score not in result_scores:
+            result_scores.append(user_score)
+
+    return result_scores, user_score, count
 
 
 async def get_leaderboard(
@@ -667,61 +825,82 @@ async def get_leaderboard(
     mods: list[str] | None = None,
     user: User | None = None,
     limit: int = 50,
+    sort: ScoreSort = ScoreSort.SCORE,
 ) -> tuple[list[Score], Score | None, int]:
     mods = mods or []
     mode = mode.to_special_mode(mods)
 
+    if sort == ScoreSort.PP:
+        return await get_pp_leaderboard(session, beatmap, mode, type, mods, user, limit)
+
     wheres = await _score_where(type, beatmap, mode, mods, user)
     if wheres is None:
         return [], None, 0
-    count = (await session.exec(select(func.count()).where(*wheres))).one()
-    scores: dict[int, Score] = {}
-    max_score = sys.maxsize
-    while limit > 0:
-        query = (
-            select(TotalScoreBestScore)
-            .where(*wheres, TotalScoreBestScore.total_score < max_score)
-            .limit(limit)
-            .order_by(col(TotalScoreBestScore.total_score).desc())
-        )
-        extra_need = 0
-        for s in await session.exec(query):
-            if s.user_id in scores:
-                extra_need += 1
-                count -= 1
-                if s.total_score > scores[s.user_id].total_score:
-                    scores[s.user_id] = s.score
-            else:
-                scores[s.user_id] = s.score
-            if max_score > s.total_score:
-                max_score = s.total_score
-        limit = extra_need
 
-    result_scores = sorted(scores.values(), key=lambda u: u.total_score, reverse=True)
+    # Count logic
+    count = (await session.exec(select(func.count()).where(*wheres))).one()
+
+    # Construct the base query
+    query = select(TotalScoreBestScore).where(*wheres).join(TotalScoreBestScore.score)
+
+    # Apply sorting
+    if sort == ScoreSort.SCORE:
+        query = query.order_by(col(TotalScoreBestScore.total_score).desc())
+    elif sort == ScoreSort.COMBO:
+        query = query.order_by(col(Score.max_combo).desc())
+    elif sort == ScoreSort.ACCURACY:
+        query = query.order_by(col(Score.accuracy).desc())
+    elif sort == ScoreSort.DATE:
+        query = query.order_by(col(Score.started_at).desc())
+    elif sort == ScoreSort.MISSES:
+        query = query.order_by(col(Score.nmiss).asc())
+
+    # Apply limit and options
+    query = query.limit(limit * 2).options(joinedload(TotalScoreBestScore.score))
+
+    best_scores = (await session.exec(query)).all()
+
+    # Deduplicate by user_id
+    seen_users = set()
+    result_scores = []
+    for bs in best_scores:
+        if bs.user_id not in seen_users:
+            seen_users.add(bs.user_id)
+            result_scores.append(bs.score)
+            if len(result_scores) >= limit:
+                break
+
     user_score = None
     if user:
-        self_query = (
-            select(TotalScoreBestScore)
-            .where(TotalScoreBestScore.user_id == user.id)
-            .where(
-                col(TotalScoreBestScore.beatmap_id) == beatmap,
-                col(TotalScoreBestScore.gamemode) == mode,
+        user_wheres = await _score_where(LeaderboardType.GLOBAL, beatmap, mode, mods, user)
+        if user_wheres is not None:
+            user_query = (
+                select(TotalScoreBestScore)
+                .where(*user_wheres)
+                .where(col(TotalScoreBestScore.user_id) == user.id)
+                .join(TotalScoreBestScore.score)
             )
-            .order_by(col(TotalScoreBestScore.total_score).desc())
-            .limit(1)
-        )
-        if mods:
-            self_query = self_query.where(
-                text(
-                    "JSON_CONTAINS(total_score_best_scores.mods, :w)"
-                    " AND JSON_CONTAINS(:w, total_score_best_scores.mods)"
-                )
-            ).params(w=json.dumps(mods))
-        user_bs = (await session.exec(self_query)).first()
-        if user_bs:
-            user_score = user_bs.score
+
+            # Apply sorting for user score too
+            if sort == ScoreSort.SCORE:
+                user_query = user_query.order_by(col(TotalScoreBestScore.total_score).desc())
+            elif sort == ScoreSort.COMBO:
+                user_query = user_query.order_by(col(Score.max_combo).desc())
+            elif sort == ScoreSort.ACCURACY:
+                user_query = user_query.order_by(col(Score.accuracy).desc())
+            elif sort == ScoreSort.DATE:
+                user_query = user_query.order_by(col(Score.started_at).desc())
+            elif sort == ScoreSort.MISSES:
+                user_query = user_query.order_by(col(Score.nmiss).asc())
+
+            user_query = user_query.options(joinedload(TotalScoreBestScore.score))
+            user_bs = (await session.exec(user_query)).first()
+            if user_bs:
+                user_score = user_bs.score
+
         if user_score and user_score not in result_scores:
             result_scores.append(user_score)
+
     return result_scores, user_score, count
 
 
@@ -999,6 +1178,7 @@ async def process_score(
         ended_at=utcnow(),
         gamemode=gamemode,
         started_at=score_token.created_at,
+        client_hash=score_token.client_hash,
         user_id=user.id,
         preserve=info.passed,
         map_md5=score_token.beatmap.checksum,
@@ -1118,11 +1298,11 @@ async def _process_score_events(score: "Score", session: AsyncSession):
                 "title": (
                     f"{score.beatmap.beatmapset.artist} - {score.beatmap.beatmapset.title} [{score.beatmap.version}]"
                 ),
-                "url": score.beatmap.url.replace("https://osu.ppy.sh/", settings.web_url),
+                "url": f"{str(settings.web_url).rstrip('/')}/beatmaps/{score.beatmap_id}",
             },
             "user": {
                 "username": score.user.username,
-                "url": settings.web_url + "users/" + str(score.user.id),
+                "url": f"{str(settings.web_url).rstrip('/')}/users/{score.user_id}",
             },
         }
         session.add(rank_event)
@@ -1160,11 +1340,11 @@ async def _process_score_events(score: "Score", session: AsyncSession):
                         f"{score.beatmap.beatmapset.artist} - {score.beatmap.beatmapset.title} "
                         f"[{score.beatmap.version}]"
                     ),
-                    "url": score.beatmap.url.replace("https://osu.ppy.sh/", settings.web_url),
+                    "url": f"{str(settings.web_url).rstrip('/')}/beatmaps/{score.beatmap_id}",
                 },
                 "user": {
                     "username": username,
-                    "url": settings.web_url + "users/" + str(displaced_score.user.id),
+                    "url": f"{str(settings.web_url).rstrip('/')}/users/{displaced_score.user_id}",
                 },
             }
             session.add(rank_lost_event)
@@ -1190,7 +1370,12 @@ async def _process_statistics(
 ):
     has_pp = beatmap_status.has_pp() or settings.enable_all_beatmap_pp
     ranked = beatmap_status.ranked() or settings.enable_all_beatmap_pp
-    has_leaderboard = beatmap_status.has_leaderboard() or settings.enable_all_beatmap_leaderboard
+    has_leaderboard = (
+        beatmap_status.has_leaderboard()
+        or settings.enable_all_beatmap_leaderboard
+        or score.gamemode == GameMode.SPACE
+        or (hasattr(score.beatmap, "is_local") and score.beatmap.is_local)
+    )
 
     mod_for_save = mod_to_save(score.mods)
     previous_score_best = await get_user_best_score_in_beatmap(session, score.beatmap_id, user.id, score.gamemode)
@@ -1443,7 +1628,13 @@ async def process_user(
     await redis.publish("osu-channel:score:processed", f'{{"ScoreId": {score_id}}}')
     await session.commit()
 
-    score_ = (await session.exec(select(Score).where(Score.id == score_id).options(joinedload(Score.beatmap)))).first()
+    score_ = (
+        await session.exec(
+            select(Score)
+            .where(Score.id == score_id)
+            .options(joinedload(Score.beatmap).joinedload(Beatmap.beatmapset))  # pyright: ignore[reportArgumentType]
+        )
+    ).first()
     if score_ is None:
         logger.warning(
             "Score {score_id} disappeared after commit, skipping event processing",

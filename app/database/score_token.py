@@ -16,6 +16,7 @@ class ScoreTokenBase(SQLModel, UTCBaseModel):
     score_id: int | None = Field(sa_column=Column(BigInteger), default=None)
     ruleset_id: GameMode
     playlist_item_id: int | None = Field(default=None)  # playlist
+    client_hash: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=utcnow, sa_column=Column(DateTime))
     updated_at: datetime = Field(default_factory=utcnow, sa_column=Column(DateTime))
 
