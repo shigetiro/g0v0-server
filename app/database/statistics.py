@@ -55,6 +55,11 @@ class UserStatisticsModel(DatabaseModel[UserStatisticsDict]):
         "user.country",
         "user.cover",
         "user.team",
+        "user.is_admin",
+        "user.is_gmt",
+        "user.is_qat",
+        "user.is_bng",
+        "user.badges",
     ]
 
     mode: GameMode = Field(index=True)
@@ -136,11 +141,11 @@ class UserStatisticsModel(DatabaseModel[UserStatisticsDict]):
 
     @ondemand
     @staticmethod
-    async def user(_session: AsyncSession, statistics: "UserStatistics") -> "UserDict":
+    async def user(_session: AsyncSession, statistics: "UserStatistics", includes: list[str] | None = None) -> "UserDict":
         from .user import UserModel
 
         user_instance = await statistics.awaitable_attrs.user
-        return await UserModel.transform(user_instance)
+        return await UserModel.transform(user_instance, includes=includes)
 
 
 class UserStatistics(AsyncAttrs, UserStatisticsModel, table=True):
