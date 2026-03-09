@@ -16,12 +16,84 @@ from app.models.score import GameMode
 from app.router.notification import server
 from app.service.ranking_cache_service import get_ranking_cache_service
 from app.utils import api_doc, check_image, utcnow
+from app.log import log
 
 from .router import router
 
 from fastapi import File, Form, HTTPException, Path, Query, Request
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import col, exists, select
+
+logger = log("Team")
+
+
+async def _repair_leader_membership_if_missing(
+    session: Database,
+    user_id: int,
+    team_id: int,
+) -> bool:
+    membership_exists = (
+        await session.exec(
+            select(exists()).where(
+                TeamMember.user_id == user_id,
+                TeamMember.team_id == team_id,
+            )
+        )
+    ).first()
+
+    pending_self_requests = (
+        await session.exec(
+            select(TeamRequest).where(
+                TeamRequest.user_id == user_id,
+                TeamRequest.team_id == team_id,
+            )
+        )
+    ).all()
+
+    if membership_exists and not pending_self_requests:
+        return False
+
+    if not membership_exists:
+        session.add(TeamMember(user_id=user_id, team_id=team_id, joined_at=utcnow()))
+
+    for pending_request in pending_self_requests:
+        await session.delete(pending_request)
+
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        membership_exists_now = (
+            await session.exec(
+                select(exists()).where(
+                    TeamMember.user_id == user_id,
+                    TeamMember.team_id == team_id,
+                )
+            )
+        ).first()
+        if not membership_exists_now:
+            raise
+
+    return True
+
+
+async def _cleanup_team_assets(
+    storage: StorageService,
+    flag_storage_path: str | None,
+    cover_storage_path: str | None,
+):
+    if flag_storage_path:
+        try:
+            await storage.delete_file(flag_storage_path)
+        except Exception:
+            logger.warning(f"Failed to cleanup orphan team flag asset: {flag_storage_path}")
+
+    if cover_storage_path:
+        try:
+            await storage.delete_file(cover_storage_path)
+        except Exception:
+            logger.warning(f"Failed to cleanup orphan team cover asset: {cover_storage_path}")
 
 
 class TeamJoinRequestResp(BaseModel):
@@ -56,6 +128,33 @@ async def create_team(
     if (await current_user.awaitable_attrs.team_membership) is not None:
         raise HTTPException(status_code=403, detail="You are already in a team")
 
+    # Legacy recovery: teams may exist with leader_id set but missing team_members row.
+    orphan_leader_team = (
+        await session.exec(
+            select(Team)
+            .where(Team.leader_id == current_user.id)
+            .order_by(col(Team.created_at).desc(), col(Team.id).desc())
+        )
+    ).first()
+    if orphan_leader_team is not None:
+        has_membership = (
+            await session.exec(
+                select(exists()).where(
+                    TeamMember.user_id == current_user.id,
+                    TeamMember.team_id == orphan_leader_team.id,
+                )
+            )
+        ).first()
+        if not has_membership:
+            repaired = await _repair_leader_membership_if_missing(session, current_user.id, orphan_leader_team.id)
+            if repaired:
+                cache_service = get_ranking_cache_service(redis)
+                await cache_service.invalidate_team_cache()
+            raise HTTPException(
+                status_code=403,
+                detail=f"You are already leading a team (team_id={orphan_leader_team.id})",
+            )
+
     clean_name = name.strip()
     clean_short_name = short_name.strip()
     clean_description = description.strip() if description else None
@@ -88,24 +187,65 @@ async def create_team(
         website=clean_website,
     )
     session.add(team)
-    await session.commit()
-    await session.refresh(team)
 
-    filehash = hashlib.sha256(flag).hexdigest()
-    storage_path = f"team_flag/{team.id}_{filehash}.png"
-    if not await storage.is_exists(storage_path):
-        await storage.write_file(storage_path, flag, f"image/{flag_format}")
-    team.flag_url = await storage.get_file_url(storage_path)
+    flag_storage_path: str | None = None
+    cover_storage_path: str | None = None
+    flag_written = False
+    cover_written = False
 
-    filehash = hashlib.sha256(cover).hexdigest()
-    storage_path = f"team_cover/{team.id}_{filehash}.png"
-    if not await storage.is_exists(storage_path):
-        await storage.write_file(storage_path, cover, f"image/{cover_format}")
-    team.cover_url = await storage.get_file_url(storage_path)
+    try:
+        await session.flush()
 
-    session.add(TeamMember(user_id=current_user.id, team_id=team.id, joined_at=now))
+        filehash = hashlib.sha256(flag).hexdigest()
+        flag_storage_path = f"team_flag/{team.id}_{filehash}.png"
+        if not await storage.is_exists(flag_storage_path):
+            await storage.write_file(flag_storage_path, flag, f"image/{flag_format}")
+            flag_written = True
+        team.flag_url = await storage.get_file_url(flag_storage_path)
 
-    await session.commit()
+        filehash = hashlib.sha256(cover).hexdigest()
+        cover_storage_path = f"team_cover/{team.id}_{filehash}.png"
+        if not await storage.is_exists(cover_storage_path):
+            await storage.write_file(cover_storage_path, cover, f"image/{cover_format}")
+            cover_written = True
+        team.cover_url = await storage.get_file_url(cover_storage_path)
+
+        session.add(TeamMember(user_id=current_user.id, team_id=team.id, joined_at=now))
+        await session.commit()
+    except HTTPException:
+        await session.rollback()
+        await _cleanup_team_assets(
+            storage,
+            flag_storage_path if flag_written else None,
+            cover_storage_path if cover_written else None,
+        )
+        raise
+    except IntegrityError as exc:
+        await session.rollback()
+        await _cleanup_team_assets(
+            storage,
+            flag_storage_path if flag_written else None,
+            cover_storage_path if cover_written else None,
+        )
+        error_text = str(exc.orig).lower() if exc.orig else str(exc).lower()
+        if "name" in error_text and "duplicate" in error_text:
+            raise HTTPException(status_code=409, detail="Name already exists")
+        if "short_name" in error_text and "duplicate" in error_text:
+            raise HTTPException(status_code=409, detail="Short name already exists")
+        if "team_members" in error_text and "duplicate" in error_text:
+            raise HTTPException(status_code=403, detail="You are already in a team")
+        logger.exception("Unexpected integrity error while creating team")
+        raise HTTPException(status_code=409, detail="Team creation conflict")
+    except Exception:
+        await session.rollback()
+        await _cleanup_team_assets(
+            storage,
+            flag_storage_path if flag_written else None,
+            cover_storage_path if cover_written else None,
+        )
+        logger.exception("Unexpected error while creating team")
+        raise HTTPException(status_code=500, detail="Failed to create team")
+
     await session.refresh(team)
 
     cache_service = get_ranking_cache_service(redis)
@@ -295,9 +435,15 @@ async def get_team(
         )
     ).all()
 
+    member_users = [m.user for m in members]
+    if all(member.id != team.leader_id for member in member_users):
+        leader = await session.get(User, team.leader_id)
+        if leader and not await leader.is_restricted(session):
+            member_users.insert(0, leader)
+
     return {
         "team": await TeamResp.from_db(team, session, gamemode),
-        "members": await UserModel.transform_many([m.user for m in members], includes=["statistics", "country"]),
+        "members": await UserModel.transform_many(member_users, includes=["statistics", "country"]),
     }
 
 
@@ -366,6 +512,9 @@ async def get_team_request_status(
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
+    if team.leader_id == current_user.id:
+        return {"has_pending_request": False}
+
     if (await current_user.awaitable_attrs.team_membership) is not None:
         return {"has_pending_request": False}
 
@@ -386,6 +535,7 @@ async def request_join_team(
     session: Database,
     team_id: Annotated[int, Path(..., description="Team ID")],
     current_user: ClientUser,
+    redis: Redis,
 ):
     if await current_user.is_restricted(session):
         raise HTTPException(status_code=403, detail="Your account is restricted and cannot perform this action.")
@@ -393,6 +543,13 @@ async def request_join_team(
     team = await session.get(Team, team_id)
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
+
+    if team.leader_id == current_user.id:
+        repaired = await _repair_leader_membership_if_missing(session, current_user.id, team_id)
+        if repaired:
+            cache_service = get_ranking_cache_service(redis)
+            await cache_service.invalidate_team_cache()
+        return
 
     if (await current_user.awaitable_attrs.team_membership) is not None:
         raise HTTPException(status_code=403, detail="You are already in a team")
