@@ -19,7 +19,7 @@ from app.models.notification import NotificationDetail
 from app.service.subscribers.chat import ChatSubscriber
 from app.utils import bg_tasks, safe_json_dumps
 
-from fastapi import APIRouter, Header, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.security import SecurityScopes
 from fastapi.websockets import WebSocketState
 from sqlmodel import select, col, update
@@ -395,22 +395,24 @@ async def chat_websocket(
 
             if not auth_token:
                 await websocket.close(code=1008, reason="Missing authentication token")
+                logger.info("WebSocket rejected: missing authentication token")
                 return
 
-            user_and_token = await get_current_user_and_token(
-                session, SecurityScopes(scopes=["chat.read"]), token_pw=auth_token
-            )
-            if user_and_token is None:
+            try:
+                # Keep websocket auth permissive on scope for compatibility with
+                # older/custom clients that still use "*" password-grant tokens.
+                user_and_token = await get_current_user_and_token(
+                    session, SecurityScopes(scopes=[]), token_pw=auth_token
+                )
+            except HTTPException as auth_error:
                 await websocket.close(code=1008, reason="Invalid or expired token")
+                logger.info(
+                    f"WebSocket rejected: authentication failed "
+                    f"(status={auth_error.status_code}, detail={auth_error.detail})"
+                )
                 return
 
             await websocket.accept()
-
-            # ⚠️ ESTA ES LA LINEA QUE TE TIRA TRACEBACK SI SE DESCONECTA ANTES/EN LOGIN
-            login = await websocket.receive_json()
-            if login.get("event") != "chat.start":
-                await websocket.close(code=1008)
-                return
 
             user = user_and_token[0]
             user_id = user.id
