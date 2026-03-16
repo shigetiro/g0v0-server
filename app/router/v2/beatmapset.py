@@ -4,6 +4,7 @@ from urllib.parse import parse_qs
 
 from app.database import (
     Beatmap,
+    BeatmapPlaycounts,
     Beatmapset,
     BeatmapsetModel,
     FavouriteBeatmapset,
@@ -52,6 +53,7 @@ async def search_beatmapset(
     fetcher: Fetcher,
     redis: Redis,
     cache_service: BeatmapsetCacheService,
+    db: Database,
 ):
     params = parse_qs(qs=request.url.query, keep_blank_values=True)
     cursor = {}
@@ -82,6 +84,18 @@ async def search_beatmapset(
                 except ValueError:
                     cursor[field_name] = field_value
 
+    # 处理 played 过滤器 - 需要查询本地数据库
+    played_beatmap_ids: set[int] = set()
+    if query.played and current_user:
+        # 获取用户玩过的所有beatmap_id
+        played_counts = await db.exec(
+            select(BeatmapPlaycounts.beatmap_id).where(
+                BeatmapPlaycounts.user_id == current_user.id,
+                BeatmapPlaycounts.playcount > 0,
+            )
+        )
+        played_beatmap_ids = set(played_counts.all())
+
     if (
         "recommended" in query.c
         or len(query.r) > 0
@@ -90,8 +104,38 @@ async def search_beatmapset(
         or "mine" in query.s
         or "favourites" in query.s
     ):
-        # TODO: search locally
-        return SearchBeatmapsetsResp(total=0, beatmapsets=[])
+        # 当需要本地搜索时，先获取API结果再过滤
+        try:
+            # 移除 played 参数以获取完整的API结果
+            query_for_api = query.model_copy()
+            query_for_api.played = False
+
+            # 获取API结果（不缓存因为会被过滤）
+            api_result = await fetcher.search_beatmapset(query_for_api, cursor, redis)
+
+            # 根据 played 状态过滤结果
+            filtered_beatmapsets = []
+            for beatmapset in api_result.beatmapsets:
+                # 获取该beatmapset下的所有beatmap_id
+                beatmap_ids = {bm["id"] for bm in beatmapset.get("beatmaps", [])}
+
+                if query.played:
+                    # 过滤：只显示用户玩过的
+                    if beatmap_ids & played_beatmap_ids:  # 有交集
+                        filtered_beatmapsets.append(beatmapset)
+                else:
+                    # 过滤：只显示用户没玩过的
+                    if not (beatmap_ids & played_beatmap_ids):  # 无交集
+                        filtered_beatmapsets.append(beatmapset)
+
+            return SearchBeatmapsetsResp(
+                total=len(filtered_beatmapsets),
+                beatmapsets=filtered_beatmapsets,
+                cursor=api_result.cursor,
+                cursor_string=api_result.cursor_string,
+            )
+        except HTTPError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     # 生成查询和游标的哈希用于缓存
     query_hash = generate_hash(query.model_dump())
