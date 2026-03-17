@@ -1,8 +1,11 @@
 from typing import Annotated, Any
 
-from app.database import Relationship, RelationshipType, User
-from app.database.relationship import RelationshipModel
-from app.database.user import UserModel
+from app.database.relationship import (
+    Relationship as RelationshipTable,
+    RelationshipModel,
+    RelationshipType,
+)
+from app.database.user import User, UserModel
 from app.dependencies.api_version import APIVersion
 from app.dependencies.database import Database
 from app.dependencies.user import ClientUser, get_current_user
@@ -46,10 +49,10 @@ async def _transform_user_relation(
 ) -> dict[str, Any]:
     relationship = (
         await db.exec(
-            select(Relationship).where(
-                Relationship.user_id == current_user.id,
-                Relationship.target_id == target,
-                Relationship.type == relationship_type,
+            select(RelationshipTable).where(
+                RelationshipTable.user_id == current_user.id,
+                RelationshipTable.target_id == target,
+                RelationshipTable.type == relationship_type,
             )
         )
     ).first()
@@ -78,9 +81,9 @@ async def _upsert_relationship(
 
     relationship = (
         await db.exec(
-            select(Relationship).where(
-                Relationship.user_id == current_user.id,
-                Relationship.target_id == target,
+            select(RelationshipTable).where(
+                RelationshipTable.user_id == current_user.id,
+                RelationshipTable.target_id == target,
             )
         )
     ).first()
@@ -88,7 +91,7 @@ async def _upsert_relationship(
     if relationship:
         relationship.type = relationship_type
     else:
-        relationship = Relationship(
+        relationship = RelationshipTable(
             user_id=current_user.id,
             target_id=target,
             type=relationship_type,
@@ -99,10 +102,10 @@ async def _upsert_relationship(
         # Mirror osu-web behavior: blocking removes reverse follow.
         reverse_follow = (
             await db.exec(
-                select(Relationship).where(
-                    Relationship.user_id == target,
-                    Relationship.target_id == current_user.id,
-                    Relationship.type == RelationshipType.FOLLOW,
+                select(RelationshipTable).where(
+                    RelationshipTable.user_id == target,
+                    RelationshipTable.target_id == current_user.id,
+                    RelationshipTable.type == RelationshipType.FOLLOW,
                 )
             )
         ).first()
@@ -125,10 +128,10 @@ async def _delete_relationship(
 
     relationship = (
         await db.exec(
-            select(Relationship).where(
-                Relationship.user_id == current_user.id,
-                Relationship.target_id == target,
-                Relationship.type == relationship_type,
+            select(RelationshipTable).where(
+                RelationshipTable.user_id == current_user.id,
+                RelationshipTable.target_id == target,
+                RelationshipTable.type == relationship_type,
             )
         )
     ).first()
@@ -164,10 +167,10 @@ async def get_relationships(
     show_nsfw_media = await UserModel.viewer_allows_nsfw_media(current_user)
     relationship_type = _relationship_type_from_path(str(request.url.path))
     relationships = await db.exec(
-        select(Relationship).where(
-            Relationship.user_id == current_user.id,
-            Relationship.type == relationship_type,
-            ~User.is_restricted_query(col(Relationship.target_id)),
+        select(RelationshipTable).where(
+            RelationshipTable.user_id == current_user.id,
+            RelationshipTable.type == relationship_type,
+            ~User.is_restricted_query(col(RelationshipTable.target_id)),
         )
     )
     unique_relationships = relationships.unique()

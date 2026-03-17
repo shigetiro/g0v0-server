@@ -1,13 +1,12 @@
 from typing import Annotated
 
-from app.database import Relationship
-from app.database.relationship import RelationshipType
+from app.database.relationship import Relationship as RelationshipTable, RelationshipType
 from app.dependencies.database import Database
 from app.dependencies.user import ClientUser
 
 from .router import router
 
-from fastapi import HTTPException, Path
+from fastapi import Path
 from pydantic import BaseModel, Field
 from sqlmodel import select
 
@@ -31,22 +30,26 @@ async def check_user_relationship(
     current_user: ClientUser,
 ):
     if user_id == current_user.id:
-        raise HTTPException(422, "Cannot check relationship with yourself")
+        return CheckResponse(
+            is_followed=False,
+            is_following=False,
+            mutual=False,
+        )
 
     my_relationship = (
         await db.exec(
-            select(Relationship).where(
-                Relationship.user_id == current_user.id,
-                Relationship.target_id == user_id,
+            select(RelationshipTable).where(
+                RelationshipTable.user_id == current_user.id,
+                RelationshipTable.target_id == user_id,
             )
         )
     ).first()
 
     target_relationship = (
         await db.exec(
-            select(Relationship).where(
-                Relationship.user_id == user_id,
-                Relationship.target_id == current_user.id,
+            select(RelationshipTable).where(
+                RelationshipTable.user_id == user_id,
+                RelationshipTable.target_id == current_user.id,
             )
         )
     ).first()
