@@ -314,25 +314,27 @@ async def create_new_pm(
         includes=["recent_messages.sender"],
         show_nsfw_media=show_nsfw_media,
     )
-    msg = ChatMessage(
+    message_resp = await redis_message_system.send_message(
+        channel_id=channel.channel_id,
+        user=current_user,
+        content=req.message,
+        is_action=req.is_action,
+        user_uuid=req.uuid,
+    )
+    await server.send_message_to_channel(message_resp)
+
+    temp_msg = ChatMessage(
+        message_id=message_resp["message_id"],
         channel_id=channel.channel_id,
         content=req.message,
         sender_id=user_id,
         type=MessageType.ACTION if req.is_action else MessageType.PLAIN,
         uuid=req.uuid,
     )
-    session.add(msg)
-    await session.commit()
-    await session.refresh(msg)
-    await session.refresh(current_user)
-    await session.refresh(channel)
-    message_resp = await ChatMessageModel.transform(
-        msg,
-        user=current_user,
-        includes=["sender"],
-        show_nsfw_media=show_nsfw_media,
+    receiver_ids = [int(uid) for uid in channel.channel_name.split("_")[1:]]
+    await server.new_private_notification(
+        ChannelMessage.init(temp_msg, current_user, receiver_ids, ChannelType.PM)
     )
-    await server.send_message_to_channel(message_resp)
     return {
         "channel": channel_resp,
         "message": message_resp,
