@@ -15,7 +15,10 @@ from .router import router
 
 from fastapi import HTTPException, Path, Query, Request, Security
 from pydantic import BaseModel
+from sqlalchemy.orm import selectinload
 from sqlmodel import col, exists, select
+
+FRIEND_TARGET_INCLUDES = [*User.CARD_INCLUDES, "support_level"]
 
 
 class RelationshipTargetBody(BaseModel):
@@ -153,7 +156,7 @@ async def _delete_relationship(
         200: api_doc(
             "Friend list. For x-api-version < 20241022 returns User[]; otherwise Relationship[].",
             list[RelationshipModel] | list[UserModel],
-            [f"target.{inc}" for inc in User.LIST_INCLUDES],
+            ["mutual", *[f"target.{inc}" for inc in FRIEND_TARGET_INCLUDES]],
         )
     },
 )
@@ -170,21 +173,38 @@ async def get_relationships(
 ):
     show_nsfw_media = await UserModel.viewer_allows_nsfw_media(current_user)
     relationship_type = _relationship_type_from_path(str(request.url.path))
-    relationships = await db.exec(
+    relationships_stmt = (
         select(RelationshipTable).where(
             RelationshipTable.user_id == current_user.id,
             RelationshipTable.type == relationship_type,
             ~User.is_restricted_query(col(RelationshipTable.target_id)),
         )
-    )
-    unique_relationships = relationships.unique()
+    ).options(selectinload(RelationshipTable.target))
+    relationships = await db.exec(relationships_stmt)
+    unique_relationships = list(relationships.unique().all())
+
+    mutual_target_ids: set[int] | None = None
+    if relationship_type == RelationshipType.FOLLOW and unique_relationships:
+        target_ids = [rel.target_id for rel in unique_relationships]
+        reverse_follows = await db.exec(
+            select(RelationshipTable.user_id).where(
+                RelationshipTable.target_id == current_user.id,
+                RelationshipTable.type == RelationshipType.FOLLOW,
+                col(RelationshipTable.user_id).in_(target_ids),
+            )
+        )
+        mutual_target_ids = set(reverse_follows.all())
+
     if api_version >= 20241022 or relationship_type == RelationshipType.BLOCK:
+        target_includes = FRIEND_TARGET_INCLUDES if relationship_type == RelationshipType.FOLLOW else User.CARD_INCLUDES
+        relation_includes = ["mutual", *[f"target.{inc}" for inc in target_includes]]
         return [
             await RelationshipModel.transform(
                 rel,
-                includes=[f"target.{inc}" for inc in User.LIST_INCLUDES],
+                includes=relation_includes,
                 ruleset=current_user.playmode,
                 show_nsfw_media=show_nsfw_media,
+                mutual_target_ids=mutual_target_ids,
             )
             for rel in unique_relationships
         ]
@@ -193,7 +213,7 @@ async def get_relationships(
         await UserModel.transform(
             rel.target,
             ruleset=current_user.playmode,
-            includes=User.LIST_INCLUDES,
+            includes=FRIEND_TARGET_INCLUDES,
             show_nsfw_media=True,
         )
         for rel in unique_relationships

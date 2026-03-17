@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from app.models.score import GameMode
 
-from ._base import DatabaseModel, included, ondemand
+from ._base import DatabaseModel, ondemand
 
 from sqlmodel import (
     BigInteger,
@@ -59,22 +59,29 @@ class RelationshipModel(DatabaseModel[RelationshipDict]):
     )
     type: RelationshipType = Field(default=RelationshipType.FOLLOW, nullable=False)
 
-    @included
+    @ondemand
     @staticmethod
-    async def mutual(session: AsyncSession, relationship: "Relationship") -> bool:
+    async def mutual(
+        session: AsyncSession,
+        relationship: "Relationship",
+        mutual_target_ids: set[int] | None = None,
+    ) -> bool:
+        if relationship.type != RelationshipType.FOLLOW:
+            return False
+
+        if mutual_target_ids is not None:
+            return relationship.target_id in mutual_target_ids
+
         target_relationship = (
             await session.exec(
                 select(Relationship).where(
                     Relationship.user_id == relationship.target_id,
                     Relationship.target_id == relationship.user_id,
+                    Relationship.type == RelationshipType.FOLLOW,
                 )
             )
         ).first()
-        return bool(
-            target_relationship is not None
-            and relationship.type == RelationshipType.FOLLOW
-            and target_relationship.type == RelationshipType.FOLLOW
-        )
+        return target_relationship is not None
 
     @ondemand
     @staticmethod
