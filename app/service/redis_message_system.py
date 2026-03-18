@@ -450,39 +450,48 @@ class RedisMessageSystem:
             await self.redis.setnx("global_message_id_counter", 1000000)
 
     async def _cleanup_redis_keys(self):
-        """清理可能存在问题的 Redis 键"""
+        """Clean Redis keys used by chat message transport."""
         try:
-            # 扫描所有 channel:*:messages 键并检查类型
-            keys_pattern = "channel:*:messages"
-            keys = await self.redis.keys(keys_pattern)
-            keys = await self.redis.keys("msg:*:*")
-            for key in keys:
-                t = await self.redis.type(key)
-                if t not in ("none", "string"):
-                    logger.warning(f"Cleaning wrong-type message key {key}: {t}")
-                    await self.redis.delete(key)
-
             fixed_count = 0
-            for key in keys:
+
+            channel_keys = await self.redis.keys("channel:*:messages")
+            for key in channel_keys:
                 try:
                     key_type = await self.redis.type(key)
-                    if key_type == "none":
-                        # 键不存在，正常情况
-                        continue
-                    elif key_type != "zset":
+                    if key_type not in ("none", "zset"):
                         logger.warning(f"Cleaning up Redis key {key} with wrong type: {key_type}")
                         await self.redis.delete(key)
-
-                        # 验证删除是否成功
                         verify_type = await self.redis.type(key)
                         if verify_type != "none":
                             logger.error(f"Failed to delete problematic key {key}, trying unlink...")
                             await self.redis.unlink(key)
-
                         fixed_count += 1
                 except Exception as cleanup_error:
                     logger.warning(f"Failed to cleanup key {key}: {cleanup_error}")
-                    # 强制删除问题键
+                    try:
+                        await self.redis.delete(key)
+                        fixed_count += 1
+                    except Exception:
+                        try:
+                            await self.redis.unlink(key)
+                            fixed_count += 1
+                        except Exception as final_error:
+                            logger.error(f"Critical: Unable to clear problematic key {key}: {final_error}")
+
+            message_keys = await self.redis.keys("msg:*:*")
+            for key in message_keys:
+                try:
+                    key_type = await self.redis.type(key)
+                    if key_type not in ("none", "string"):
+                        logger.warning(f"Cleaning wrong-type message key {key}: {key_type}")
+                        await self.redis.delete(key)
+                        verify_type = await self.redis.type(key)
+                        if verify_type != "none":
+                            logger.error(f"Failed to delete problematic key {key}, trying unlink...")
+                            await self.redis.unlink(key)
+                        fixed_count += 1
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup key {key}: {cleanup_error}")
                     try:
                         await self.redis.delete(key)
                         fixed_count += 1
@@ -532,3 +541,4 @@ class RedisMessageSystem:
 
 # 全局消息系统实例
 redis_message_system = RedisMessageSystem()
+

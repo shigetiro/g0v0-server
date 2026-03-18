@@ -15,7 +15,7 @@ from app.auth import (
 )
 from app.config import settings
 from app.const import BANCHOBOT_ID, SUPPORT_TOTP_VERIFICATION_VER
-from app.database import DailyChallengeStats, OAuthClient, Relationship, RelationshipType, User
+from app.database import DailyChallengeStats, OAuthClient, User
 from app.database.auth import TotpKeys
 from app.database.statistics import UserStatistics
 from app.dependencies.api_version import APIVersion
@@ -231,42 +231,6 @@ def validate_email(email: str) -> list[str]:
 
 
 router = APIRouter(tags=["osu! OAuth è®¤è¯"])
-DEFAULT_OWNER_FRIEND_USER_ID = 3
-
-
-async def _ensure_default_owner_friend_relationships(db: Database, new_user_id: int) -> None:
-    owner_id = DEFAULT_OWNER_FRIEND_USER_ID
-    if new_user_id == owner_id:
-        return
-
-    owner_exists = (await db.exec(select(exists()).where(User.id == owner_id))).first()
-    if not owner_exists:
-        return
-
-    default_pairs = (
-        (new_user_id, owner_id),
-        (owner_id, new_user_id),
-    )
-    for user_id, target_id in default_pairs:
-        already_exists = (
-            await db.exec(
-                select(exists()).where(
-                    Relationship.user_id == user_id,
-                    Relationship.target_id == target_id,
-                    Relationship.type == RelationshipType.FOLLOW,
-                )
-            )
-        ).first()
-        if already_exists:
-            continue
-
-        db.add(
-            Relationship(
-                user_id=user_id,
-                target_id=target_id,
-                type=RelationshipType.FOLLOW,
-            )
-        )
 
 
 @router.post(
@@ -374,7 +338,6 @@ async def register_user(
             db.add(statistics_ap)
         daily_challenge_user_stats = DailyChallengeStats(user_id=new_user.id)
         db.add(daily_challenge_user_stats)
-        await _ensure_default_owner_friend_relationships(db, new_user.id)
         await db.commit()
     except Exception:
         await db.rollback()

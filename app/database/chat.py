@@ -85,15 +85,81 @@ class ChatChannelModel(DatabaseModel[ChatChannelDict]):
     icon: str | None = Field(default=None)
     type: ChannelType = Field(index=True)
 
+    @staticmethod
+    def _pm_user_ids_from_channel_name(channel_name: str | None) -> tuple[int, int] | None:
+        if not channel_name or not channel_name.startswith("pm_"):
+            return None
+
+        parts = channel_name.split("_", maxsplit=2)
+        if len(parts) != 3:
+            return None
+
+        try:
+            user1_id = int(parts[1])
+            user2_id = int(parts[2])
+        except ValueError:
+            return None
+
+        return (user1_id, user2_id)
+
+    @staticmethod
+    def _pm_target_user_id_from_channel_name(channel_name: str | None, current_user_id: int) -> int | None:
+        user_ids = ChatChannelModel._pm_user_ids_from_channel_name(channel_name)
+        if user_ids is None:
+            return None
+
+        user1_id, user2_id = user_ids
+
+        if current_user_id == user1_id:
+            return user2_id
+        if current_user_id == user2_id:
+            return user1_id
+
+        return None
+
+    @staticmethod
+    async def _pm_target_user_id_from_recent_messages(
+        session: AsyncSession,
+        channel_id: int,
+        current_user_id: int,
+    ) -> int | None:
+        recent_sender_ids = (
+            await session.exec(
+                select(ChatMessage.sender_id)
+                .where(ChatMessage.channel_id == channel_id)
+                .order_by(col(ChatMessage.message_id).desc())
+                .limit(100)
+            )
+        ).all()
+
+        for sender_id in recent_sender_ids:
+            if sender_id != current_user_id:
+                return int(sender_id)
+
+        return None
+
     @included
     @staticmethod
     async def name(session: AsyncSession, channel: "ChatChannel", user: User, server: "ChatServer") -> str:
-        users = server.channels.get(channel.channel_id, [])
-        if channel.type == ChannelType.PM and users and len(users) == 2:
-            target_user_id = next(u for u in users if u != user.id)
-            target_name = await session.exec(select(User.username).where(User.id == target_user_id))
-            return target_name.one()
-        return channel.channel_name
+        if channel.type == ChannelType.PM:
+            users = server.channels.get(channel.channel_id, [])
+            target_user_id = next((u for u in users if u != user.id), None)
+            if target_user_id is None:
+                target_user_id = ChatChannelModel._pm_target_user_id_from_channel_name(channel.channel_name, user.id)
+            if target_user_id is None:
+                target_user_id = await ChatChannelModel._pm_target_user_id_from_recent_messages(
+                    session,
+                    channel.channel_id,
+                    user.id,
+                )
+
+            if target_user_id is not None:
+                target_name = await session.exec(select(User.username).where(User.id == target_user_id))
+                username = target_name.first()
+                if username:
+                    return username
+
+        return channel.channel_name or f"pm_{channel.channel_id}"
 
     @included
     @staticmethod
@@ -188,7 +254,7 @@ class ChatChannelModel(DatabaseModel[ChatChannelDict]):
     @ondemand
     @staticmethod
     async def users(
-        _session: AsyncSession,
+        session: AsyncSession,
         channel: "ChatChannel",
         server: "ChatServer",
         user: User,
@@ -196,9 +262,21 @@ class ChatChannelModel(DatabaseModel[ChatChannelDict]):
         if channel.type == ChannelType.PUBLIC:
             return []
         users = server.channels.get(channel.channel_id, []).copy()
-        if channel.type == ChannelType.PM and users and len(users) == 2:
-            target_user_id = next(u for u in users if u != user.id)
-            users = [target_user_id, user.id]
+        if channel.type == ChannelType.PM:
+            target_user_id = next((u for u in users if u != user.id), None)
+            if target_user_id is None:
+                target_user_id = ChatChannelModel._pm_target_user_id_from_channel_name(channel.channel_name, user.id)
+            if target_user_id is None:
+                target_user_id = await ChatChannelModel._pm_target_user_id_from_recent_messages(
+                    session,
+                    channel.channel_id,
+                    user.id,
+                )
+            if target_user_id is not None:
+                users = [target_user_id, user.id]
+            elif not users:
+                # osu! clients assume PM channels always have at least one avatar target.
+                users = [user.id]
         return users
 
     @included

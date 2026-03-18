@@ -19,6 +19,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import col, exists, select
 
 FRIEND_TARGET_INCLUDES = [*User.CARD_INCLUDES, "support_level"]
+DEFAULT_OWNER_FRIEND_USER_ID = 3
 
 
 class RelationshipTargetBody(BaseModel):
@@ -118,6 +119,31 @@ async def _upsert_relationship(
         ).first()
         if reverse_follow:
             await db.delete(reverse_follow)
+
+    if (
+        relationship_type == RelationshipType.FOLLOW
+        and target == DEFAULT_OWNER_FRIEND_USER_ID
+        and current_user_id != DEFAULT_OWNER_FRIEND_USER_ID
+    ):
+        owner_follow = (
+            await db.exec(
+                select(RelationshipTable).where(
+                    RelationshipTable.user_id == DEFAULT_OWNER_FRIEND_USER_ID,
+                    RelationshipTable.target_id == current_user_id,
+                )
+            )
+        ).first()
+
+        if owner_follow is None:
+            db.add(
+                RelationshipTable(
+                    user_id=DEFAULT_OWNER_FRIEND_USER_ID,
+                    target_id=current_user_id,
+                    type=RelationshipType.FOLLOW,
+                )
+            )
+        elif owner_follow.type != RelationshipType.BLOCK:
+            owner_follow.type = RelationshipType.FOLLOW
 
     await db.commit()
     return await _transform_user_relation(db, relationship_type, current_user_id, target, current_user_ruleset)

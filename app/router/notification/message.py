@@ -35,18 +35,36 @@ class KeepAliveResp(BaseModel):
 logger = log("Chat")
 
 
+def _canonical_pm_channel_name(user_a_id: int, user_b_id: int) -> str:
+    low, high = sorted((int(user_a_id), int(user_b_id)))
+    return f"pm_{low}_{high}"
+
+
+def _resolve_pm_receiver_ids(channel_name: str | None, channel_id: int, sender_id: int) -> list[int]:
+    receiver_ids: list[int] = []
+
+    pm_user_ids = ChatChannelModel._pm_user_ids_from_channel_name(channel_name)
+    if pm_user_ids is not None:
+        receiver_ids = [uid for uid in pm_user_ids if uid != sender_id]
+
+    if not receiver_ids:
+        receiver_ids = [uid for uid in server.channels.get(channel_id, []) if uid != sender_id]
+
+    return list(dict.fromkeys(receiver_ids))
+
+
 @router.post(
     "/chat/ack",
-    name="保持连接",
+    name="Chat ack",
     response_model=KeepAliveResp,
-    description="保持公共频道的连接。同时返回最近的禁言列表。",
-    tags=["聊天"],
+    description="Keep chat connection alive and return recent silences.",
+    tags=["Chat"],
 )
 async def keep_alive(
     session: Database,
     current_user: Annotated[User, Security(get_current_user, scopes=["chat.read"])],
-    history_since: Annotated[int | None, Query(description="获取自此禁言 ID 之后的禁言记录")] = None,
-    since: Annotated[int | None, Query(description="获取自此消息 ID 之后的禁言记录")] = None,
+    history_since: Annotated[int | None, Query(description="Fetch silences after this silence ID")] = None,
+    since: Annotated[int | None, Query(description="Fetch silences after this message ID")] = None,
 ):
     resp = KeepAliveResp()
     if history_since:
@@ -69,21 +87,20 @@ class MessageReq(BaseModel):
 
 @router.post(
     "/chat/channels/{channel}/messages",
-    responses={200: api_doc("发送的消息", ChatMessageModel, ["sender", "is_action"])},
-    name="发送消息",
-    description="发送消息到指定频道。",
-    tags=["聊天"],
+    responses={200: api_doc("Sent message", ChatMessageModel, ["sender", "is_action"])},
+    name="Send message",
+    description="Send message to a channel.",
+    tags=["Chat"],
 )
 async def send_message(
     session: Database,
-    channel: Annotated[str, Path(..., description="频道 ID/名称")],
+    channel: Annotated[str, Path(..., description="Channel ID or name")],
     req: Annotated[MessageReq, Depends(BodyOrForm(MessageReq))],
     current_user: Annotated[User, Security(get_current_user, scopes=["chat.write"])],
 ):
     if await current_user.is_restricted(session):
         raise HTTPException(status_code=403, detail="You are restricted from sending messages")
 
-    # 使用明确的查询来获取 channel，避免延迟加载
     if channel.isdigit():
         db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == int(channel)))).first()
     else:
@@ -92,25 +109,22 @@ async def send_message(
     if db_channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
 
-    # 立即提取所有需要的属性，避免后续延迟加载
     channel_id = db_channel.channel_id
     channel_type = db_channel.type
     channel_name = db_channel.channel_name
     user_id = current_user.id
 
-    # 对于多人游戏房间，在发送消息前进行Redis键检查
     if channel_type == ChannelType.MULTIPLAYER:
         try:
             redis = redis_message_client
             key = f"channel:{channel_id}:messages"
             key_type = await redis.type(key)
             if key_type not in ["none", "zset"]:
-                logger.warning(f"Fixing Redis key {key} with wrong type: {key_type}")
+                logger.warning("Fixing Redis key %s with wrong type: %s", key, key_type)
                 await redis.delete(key)
-        except Exception as e:
-            logger.warning(f"Failed to check/fix Redis key for channel {channel_id}: {e}")
+        except Exception as exc:
+            logger.warning("Failed to check/fix Redis key for channel %s: %s", channel_id, exc)
 
-    # 使用 Redis 消息系统发送消息 - 立即返回
     resp = await redis_message_system.send_message(
         channel_id=channel_id,
         user=current_user,
@@ -119,19 +133,17 @@ async def send_message(
         user_uuid=req.uuid,
     )
 
-    # 立即广播消息给所有客户端
     is_bot_command = req.message.startswith("!")
     await server.send_message_to_channel(resp, is_bot_command and channel_type == ChannelType.PUBLIC)
 
-    # 处理机器人命令
     if is_bot_command:
         await bot.try_handle(current_user, db_channel, req.message, session)
 
     await session.refresh(current_user)
-    # 为通知系统创建临时 ChatMessage 对象（仅适用于私聊和团队频道）
+
     if channel_type in [ChannelType.PM, ChannelType.TEAM]:
         temp_msg = ChatMessage(
-            message_id=resp["message_id"],  # 使用 Redis 系统生成的ID
+            message_id=resp["message_id"],
             channel_id=channel_id,
             content=req.message,
             sender_id=user_id,
@@ -140,10 +152,18 @@ async def send_message(
         )
 
         if channel_type == ChannelType.PM:
-            user_ids = channel_name.split("_")[1:]
-            await server.new_private_notification(
-                ChannelMessage.init(temp_msg, current_user, [int(u) for u in user_ids], channel_type)
-            )
+            receiver_ids = _resolve_pm_receiver_ids(channel_name, channel_id, user_id)
+            if receiver_ids:
+                await server.new_private_notification(
+                    ChannelMessage.init(temp_msg, current_user, receiver_ids, channel_type)
+                )
+            else:
+                logger.warning(
+                    "Skipping PM notification: unresolved receiver (channel_id=%s channel_name=%r sender=%s)",
+                    channel_id,
+                    channel_name,
+                    user_id,
+                )
         elif channel_type == ChannelType.TEAM:
             await server.new_private_notification(ChannelMessageTeam.init(temp_msg, current_user))
 
@@ -152,21 +172,21 @@ async def send_message(
 
 @router.get(
     "/chat/channels/{channel}/messages",
-    responses={200: api_doc("获取的消息", list[ChatMessageModel], ["sender"])},
-    name="获取消息",
-    description="获取指定频道的消息列表（统一按时间正序返回）。",
-    tags=["聊天"],
+    responses={200: api_doc("Channel messages", list[ChatMessageModel], ["sender"])},
+    name="Get messages",
+    description="Fetch messages from channel in chronological order.",
+    tags=["Chat"],
 )
 async def get_message(
     session: Database,
     channel: str,
     current_user: Annotated[User, Security(get_current_user, scopes=["chat.read"])],
-    limit: Annotated[int, Query(ge=1, le=50, description="获取消息的数量")] = 50,
-    since: Annotated[int, Query(ge=0, description="获取自此消息 ID 之后的消息（向前加载新消息）")] = 0,
-    until: Annotated[int | None, Query(description="获取自此消息 ID 之前的消息（向后翻历史）")] = None,
+    limit: Annotated[int, Query(ge=1, le=50, description="Message count")] = 50,
+    since: Annotated[int, Query(ge=0, description="Fetch messages after this message ID")] = 0,
+    until: Annotated[int | None, Query(description="Fetch messages before this message ID")] = None,
 ):
     show_nsfw_media = await UserModel.viewer_allows_nsfw_media(current_user)
-    # 1) 查频道
+
     if channel.isdigit():
         db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == int(channel)))).first()
     else:
@@ -182,53 +202,43 @@ async def get_message(
         if len(messages) >= 2 and messages[0]["message_id"] > messages[-1]["message_id"]:
             messages.reverse()
         return messages
-    except Exception as e:
-        logger.warning(f"Failed to get messages from Redis system: {e}")
+    except Exception as exc:
+        logger.warning("Failed to get messages from Redis system: %s", exc)
 
-    base = select(ChatMessage).where(ChatMessage.channel_id == channel_id)
+    base_query = select(ChatMessage).where(ChatMessage.channel_id == channel_id)
 
     if since > 0 and until is None:
-        # 向前加载新消息 → 直接 ASC
-        query = base.where(col(ChatMessage.message_id) > since).order_by(col(ChatMessage.message_id).asc()).limit(limit)
+        query = base_query.where(col(ChatMessage.message_id) > since).order_by(col(ChatMessage.message_id).asc()).limit(limit)
         rows = (await session.exec(query)).all()
-        resp = await ChatMessageModel.transform_many(rows, includes=["sender"], show_nsfw_media=show_nsfw_media)
-        # 已经 ASC，无需反转
-        return resp
+        return await ChatMessageModel.transform_many(rows, includes=["sender"], show_nsfw_media=show_nsfw_media)
 
-    # until 分支（向后翻历史）
     if until is not None:
-        # 用 DESC 取最近的更早消息，再反转为 ASC
         query = (
-            base.where(col(ChatMessage.message_id) < until).order_by(col(ChatMessage.message_id).desc()).limit(limit)
+            base_query.where(col(ChatMessage.message_id) < until).order_by(col(ChatMessage.message_id).desc()).limit(limit)
         )
-        rows = (await session.exec(query)).all()
-        rows = list(rows)
-        rows.reverse()  # 反转为 ASC
-        resp = await ChatMessageModel.transform_many(rows, includes=["sender"], show_nsfw_media=show_nsfw_media)
-        return resp
+        rows = list((await session.exec(query)).all())
+        rows.reverse()
+        return await ChatMessageModel.transform_many(rows, includes=["sender"], show_nsfw_media=show_nsfw_media)
 
-    query = base.order_by(col(ChatMessage.message_id).desc()).limit(limit)
-    rows = (await session.exec(query)).all()
-    rows = list(rows)
-    rows.reverse()  # 反转为 ASC
-    resp = await ChatMessageModel.transform_many(rows, includes=["sender"], show_nsfw_media=show_nsfw_media)
-    return resp
+    query = base_query.order_by(col(ChatMessage.message_id).desc()).limit(limit)
+    rows = list((await session.exec(query)).all())
+    rows.reverse()
+    return await ChatMessageModel.transform_many(rows, includes=["sender"], show_nsfw_media=show_nsfw_media)
 
 
 @router.put(
     "/chat/channels/{channel}/mark-as-read/{message}",
     status_code=204,
-    name="标记消息为已读",
-    description="标记指定消息为已读。",
-    tags=["聊天"],
+    name="Mark as read",
+    description="Mark channel message as read.",
+    tags=["Chat"],
 )
 async def mark_as_read(
     session: Database,
-    channel: Annotated[str, Path(..., description="频道 ID/名称")],
-    message: Annotated[int, Path(..., description="消息 ID")],
+    channel: Annotated[str, Path(..., description="Channel ID or name")],
+    message: Annotated[int, Path(..., description="Message ID")],
     current_user: Annotated[User, Security(get_current_user, scopes=["chat.read"])],
 ):
-    # 使用明确的查询获取 channel，避免延迟加载
     if channel.isdigit():
         db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == int(channel)))).first()
     else:
@@ -237,9 +247,7 @@ async def mark_as_read(
     if db_channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
 
-    # 立即提取需要的属性
-    channel_id = db_channel.channel_id
-    await server.mark_as_read(channel_id, current_user.id, message)
+    await server.mark_as_read(db_channel.channel_id, current_user.id, message)
 
 
 class PMReq(BaseModel):
@@ -251,12 +259,12 @@ class PMReq(BaseModel):
 
 @router.post(
     "/chat/new",
-    name="创建私聊频道",
-    description="创建一个新的私聊频道。",
-    tags=["聊天"],
+    name="Create PM",
+    description="Create a private channel and send initial message.",
+    tags=["Chat"],
     responses={
         200: api_doc(
-            "创建私聊频道响应",
+            "Create PM response",
             {
                 "channel": ChatChannelModel,
                 "message": ChatMessageModel,
@@ -281,30 +289,29 @@ async def create_new_pm(
     target = await session.get(User, req.target_id)
     if target is None or await target.is_restricted(session):
         raise HTTPException(status_code=404, detail="Target user not found")
+
     is_can_pm, block = await target.is_user_can_pm(current_user, session)
     if not is_can_pm:
         raise HTTPException(status_code=403, detail=block)
 
+    canonical_name = _canonical_pm_channel_name(user_id, req.target_id)
     channel = await ChatChannel.get_pm_channel(user_id, req.target_id, session)
     if channel is None:
-        user_min = min(user_id, req.target_id)
-        user_max = max(user_id, req.target_id)
-        pm_name = f"pm_{user_min}_{user_max}"
-
-        channel = await ChatChannel.get_pm_channel(user_id, req.target_id, session)
-        if channel is None:
-            channel = ChatChannel(
-                channel_name=pm_name,  # ✅ correct field -> DB column `name`
-                description="Private message channel",
-                type=ChannelType.PM,
-            )
-            channel.channel_name = pm_name
-            logger.warning(f"[PM DEBUG] creating PM channel_name={pm_name!r} user_id={user_id} target_id={req.target_id}")
-            session.add(channel)
-            await session.commit()
-            await session.refresh(channel)
-            await session.refresh(target)
-            await session.refresh(current_user)
+        channel = ChatChannel(
+            channel_name=canonical_name,
+            description="Private message channel",
+            type=ChannelType.PM,
+        )
+        session.add(channel)
+        await session.commit()
+        await session.refresh(channel)
+        await session.refresh(target)
+        await session.refresh(current_user)
+    elif channel.channel_name != canonical_name:
+        channel.channel_name = canonical_name
+        session.add(channel)
+        await session.commit()
+        await session.refresh(channel)
 
     await server.batch_join_channel([target, current_user], channel)
     channel_resp = await ChatChannelModel.transform(
@@ -314,6 +321,7 @@ async def create_new_pm(
         includes=["recent_messages.sender"],
         show_nsfw_media=show_nsfw_media,
     )
+
     message_resp = await redis_message_system.send_message(
         channel_id=channel.channel_id,
         user=current_user,
@@ -331,10 +339,20 @@ async def create_new_pm(
         type=MessageType.ACTION if req.is_action else MessageType.PLAIN,
         uuid=req.uuid,
     )
-    receiver_ids = [int(uid) for uid in channel.channel_name.split("_")[1:]]
-    await server.new_private_notification(
-        ChannelMessage.init(temp_msg, current_user, receiver_ids, ChannelType.PM)
-    )
+
+    receiver_ids = _resolve_pm_receiver_ids(channel.channel_name, channel.channel_id, user_id)
+    if receiver_ids:
+        await server.new_private_notification(
+            ChannelMessage.init(temp_msg, current_user, receiver_ids, ChannelType.PM)
+        )
+    else:
+        logger.warning(
+            "Skipping PM notification in /chat/new: unresolved receiver (channel_id=%s channel_name=%r sender=%s)",
+            channel.channel_id,
+            channel.channel_name,
+            user_id,
+        )
+
     return {
         "channel": channel_resp,
         "message": message_resp,
