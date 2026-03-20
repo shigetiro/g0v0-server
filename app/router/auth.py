@@ -808,8 +808,9 @@ async def oauth_token(
 async def request_password_reset(
     request: Request,
     email: Annotated[str, Form(..., description="é‚®ç®±åœ°å€")],
-    redis: Redis,    verification_service: ClientVerificationService,
+    redis: Redis,
     user_agent: UserAgentInfo,
+    ip_address: IPAddress,
     cf_turnstile_response: Annotated[
         str, Form(description="Cloudflare Turnstile å“åº” token")
     ] = "XXXX.DUMMY.TOKEN.XXXX",
@@ -840,31 +841,48 @@ async def request_password_reset(
     if success:
         return JSONResponse(status_code=200, content={"success": True, "message": message})
     else:
-        return JSONResponse(status_code=400, content={"success": False, "error": message})
+        status_code = 429 if "too many requests" in message.lower() else 400
+        return JSONResponse(status_code=status_code, content={"success": False, "error": message})
 
 
 @router.post("/password-reset/reset", name="é‡ç½®å¯†ç ", description="ä½¿ç”¨éªŒè¯ç é‡ç½®å¯†ç ")
 async def reset_password(
+    request: Request,
     email: Annotated[str, Form(..., description="é‚®ç®±åœ°å€")],
     reset_code: Annotated[str, Form(..., description="é‡ç½®éªŒè¯ç ")],
     new_password: Annotated[str, Form(..., description="æ–°å¯†ç ")],
-    redis: Redis,    verification_service: ClientVerificationService,
+    redis: Redis,
+    user_agent: UserAgentInfo,
+    ip_address: IPAddress,
+    cf_turnstile_response: Annotated[
+        str, Form(description="Cloudflare Turnstile å“åº” token")
+    ] = "XXXX.DUMMY.TOKEN.XXXX",
 ):
     """
     é‡ç½®å¯†ç 
     """
-    # èŽ·å–å®¢æˆ·ç«¯ä¿¡æ¯
-    # é‡ç½®å¯†ç 
+    if settings.enable_turnstile_verification and not user_agent.is_client:
+        success, error_msg = await turnstile_service.verify_token(cf_turnstile_response, ip_address)
+        if not success:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": f"Verification failed: {error_msg}"},
+            )
+
+    user_agent_str = request.headers.get("User-Agent", "")
+
     success, message = await password_reset_service.reset_password(
         email=email.lower().strip(),
         reset_code=reset_code.strip(),
         new_password=new_password,
         ip_address=ip_address,
         redis=redis,
+        user_agent=user_agent_str,
     )
 
     if success:
         return JSONResponse(status_code=200, content={"success": True, "message": message})
     else:
-        return JSONResponse(status_code=400, content={"success": False, "error": message})
+        status_code = 429 if "too many" in message.lower() else 400
+        return JSONResponse(status_code=status_code, content={"success": False, "error": message})
 

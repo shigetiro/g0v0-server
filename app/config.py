@@ -414,12 +414,12 @@ CALCULATOR_CONFIG='{}'
     ]
     from_email: Annotated[
         str,
-        Field(default="noreply@example.com", description="发件人邮箱"),
+        Field(default="toriihalo@shikkesora.com", description="发件人邮箱"),
         "验证服务设置",
     ]
     from_name: Annotated[
         str,
-        Field(default="osu! server", description="发件人名称"),
+        Field(default="Torii Halo", description="发件人名称"),
         "验证服务设置",
     ]
     mailersend_api_key: Annotated[
@@ -756,3 +756,4 @@ CALCULATOR_CONFIG='{}'
 
 
 settings = Settings()  # pyright: ignore[reportCallIssue]
+
