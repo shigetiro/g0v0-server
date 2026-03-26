@@ -321,17 +321,25 @@ async def submit_score(
                 e,
             )
 
+    # _process_user runs in a dedicated session.
+    # Commit before re-reading to avoid stale snapshots (e.g. MySQL REPEATABLE READ).
+    t_commit2 = time.time()
+    await db.commit()
+    logger.info(
+        "[submit_score] pre-response db.commit done in {:.3f}s score_id={}",
+        time.time() - t_commit2,
+        score.id,
+    )
+
+    # Build response from final score object (after processing).
+    await db.refresh(score)
+
     # Build response from final score object (after processing)
     t_resp = time.time()
     resp = await ScoreModel.transform(score)
     logger.info("[submit_score] ScoreModel.transform done in {:.3f}s score_id={}", time.time() - t_resp, resp["id"])
 
     score_gamemode = score.gamemode
-
-    # Commit any remaining session state (should be cheap/no-op usually)
-    t_commit2 = time.time()
-    await db.commit()
-    logger.info("[submit_score] final db.commit done in {:.3f}s score_id={}", time.time() - t_commit2, resp["id"])
 
     # ✅ Refresh cache BEFORE returning so client reads updated stats
     if user_id is not None:
