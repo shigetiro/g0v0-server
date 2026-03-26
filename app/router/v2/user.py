@@ -36,6 +36,7 @@ from app.utils import api_doc, utcnow
 from .router import router
 
 from fastapi import BackgroundTasks, HTTPException, Path, Query, Request, Security
+from sqlalchemy.orm import joinedload
 from sqlmodel import exists, func, select, tuple_
 from sqlmodel.sql.expression import col
 
@@ -680,6 +681,10 @@ async def get_user_scores(
     gamemode = _normalize_user_mode(mode) or db_user.playmode
     where_clause = (col(Score.user_id) == db_user.id) & (col(Score.gamemode) == gamemode)
     includes = Score.USER_PROFILE_INCLUDES.copy()
+    eager_score_relations = (
+        joinedload(Score.user),
+        joinedload(Score.beatmap).joinedload(Beatmap.beatmapset),
+    )
     if not include_fails:
         where_clause &= col(Score.passed).is_(True)
 
@@ -706,6 +711,7 @@ async def get_user_scores(
             scores = (
                 await session.exec(
                     select(Score)
+                    .options(*eager_score_relations)
                     .where(where_clause)
                     .order_by(col(Score.pinned_order).asc(), col(Score.id).desc())
                     .limit(limit)
@@ -732,7 +738,11 @@ async def get_user_scores(
             where_clause &= tuple_(col(Score.pp), col(Score.id)) < tuple_(cursor_pp, cursor_id)
             scores = (
                 await session.exec(
-                    select(Score).where(where_clause).order_by(col(Score.pp).desc(), col(Score.id).desc()).limit(limit)
+                    select(Score)
+                    .options(*eager_score_relations)
+                    .where(where_clause)
+                    .order_by(col(Score.pp).desc(), col(Score.id).desc())
+                    .limit(limit)
                 )
             ).all()
 
@@ -756,6 +766,7 @@ async def get_user_scores(
             scores = (
                 await session.exec(
                     select(Score)
+                    .options(*eager_score_relations)
                     .where(where_clause)
                     .order_by(col(Score.ended_at).desc(), col(Score.id).desc())
                     .limit(limit)

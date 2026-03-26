@@ -1,3 +1,4 @@
+import asyncio
 import re
 from typing import Annotated, Literal
 from urllib.parse import parse_qs
@@ -323,32 +324,51 @@ async def download_beatmapset(
     if not download_urls:
         raise HTTPException(status_code=503, detail="No download URLs available")
 
-    timeout = httpx.Timeout(connect=8.0, read=12.0, write=12.0, pool=8.0)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        last_err = None
-        for url in download_urls:
-            try:
-                logger.info(f"[beatmap dl] probe {beatmapset_id} -> {url}")
-                async with client.stream("GET", url, headers={"Range": "bytes=0-1"}) as r:
-                    if r.status_code not in (200, 206):
-                        logger.warning(f"[beatmap dl] {url} -> {r.status_code}")
-                        continue
+    probe_candidates = download_urls[: min(3, len(download_urls))]
+    # Keep this very short to minimise "pre-download" latency before the client progress bar appears.
+    per_probe_timeout = httpx.Timeout(connect=0.5, read=0.9, write=0.9, pool=0.5)
+    total_probe_window_s = 0.9
 
-                    # Small probe: ensure response starts as ZIP when possible.
-                    first = await anext(r.aiter_bytes(chunk_size=64), b"")
-                    content_type = (r.headers.get("Content-Type") or "").lower()
-                    if first and not first.startswith(b"PK") and "zip" not in content_type and "octet-stream" not in content_type:
-                        logger.warning(f"[beatmap dl] {url} not zip-like (ct={content_type})")
-                        continue
+    async def probe_url(client: httpx.AsyncClient, url: str) -> str | None:
+        try:
+            logger.info(f"[beatmap dl] probe {beatmapset_id} -> {url}")
+            async with client.stream("GET", url, headers={"Range": "bytes=0-1"}) as r:
+                if r.status_code not in (200, 206):
+                    logger.warning(f"[beatmap dl] {url} -> {r.status_code}")
+                    return None
 
-                    logger.info(f"[beatmap dl] redirect {beatmapset_id} -> {url}")
-                    return RedirectResponse(url=url, status_code=307)
-            except Exception as e:
-                last_err = e
-                logger.warning(f"[beatmap dl] {url} probe failed: {e}")
+                # Small probe: ensure response starts as ZIP when possible.
+                first = await anext(r.aiter_bytes(chunk_size=64), b"")
+                content_type = (r.headers.get("Content-Type") or "").lower()
+                if first and not first.startswith(b"PK") and "zip" not in content_type and "octet-stream" not in content_type:
+                    logger.warning(f"[beatmap dl] {url} not zip-like (ct={content_type})")
+                    return None
 
-    logger.error(f"[beatmap dl] all mirrors failed for {beatmapset_id}: {last_err}")
-    raise HTTPException(status_code=503, detail="All beatmap mirrors failed")
+                return url
+        except Exception as e:
+            logger.warning(f"[beatmap dl] {url} probe failed: {e}")
+            return None
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=per_probe_timeout) as client:
+        probe_tasks = [asyncio.create_task(probe_url(client, url)) for url in probe_candidates]
+        try:
+            for task in asyncio.as_completed(probe_tasks, timeout=total_probe_window_s):
+                valid_url = await task
+                if valid_url:
+                    logger.info(f"[beatmap dl] redirect {beatmapset_id} -> {valid_url}")
+                    return RedirectResponse(url=valid_url, status_code=307)
+        except TimeoutError:
+            logger.info(f"[beatmap dl] probe timeout for {beatmapset_id}, falling back to primary mirror")
+        finally:
+            for task in probe_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*probe_tasks, return_exceptions=True)
+
+    # Low-latency fallback: redirect immediately to top-priority mirror even if probes were inconclusive.
+    fallback_url = download_urls[0]
+    logger.info(f"[beatmap dl] fallback redirect {beatmapset_id} -> {fallback_url}")
+    return RedirectResponse(url=fallback_url, status_code=307)
 
 
 @router.post(
