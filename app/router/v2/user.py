@@ -666,8 +666,10 @@ async def get_user_scores(
     redis = get_redis()
     cache_service = get_user_cache_service(redis)
 
-    # 先尝试从缓存获取（对于recent类型使用较短的缓存时间）
-    cache_expire = 30 if type == "recent" else settings.user_scores_cache_expire_seconds
+    # Keep "recent" fresh, but let best/pinned/firsts lean harder on Redis.
+    # Those views are explicitly invalidated on score submit / pin changes, so a
+    # longer TTL lowers DB pressure without changing the eventual result.
+    cache_expire = 20 if type == "recent" else max(settings.user_scores_cache_expire_seconds, 300)
     cached_scores = await cache_service.get_user_scores_from_cache(
         user_id, type, include_fails, mode, limit, offset, is_legacy_api
     )
