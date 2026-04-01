@@ -17,8 +17,10 @@ from app.log import logger
 from app.models.beatmap import BeatmapRankStatus
 from app.models.score import GameMode
 from app.service.pp_variant_service import (
+    apply_pp_variant_to_user_response,
     get_user_pp_variant_statistics,
     invalidate_pp_variant_caches_for_user,
+    USER_PP_DEV_PROFILE_CACHE_TTL_SECONDS,
 )
 from app.utils import safe_json_dumps
 
@@ -183,7 +185,12 @@ class UserCacheService:
         """ç¼“å­˜ç”¨æˆ·ä¿¡æ¯"""
         try:
             if expire_seconds is None:
-                expire_seconds = settings.user_cache_expire_seconds
+                # pp_dev profiles are more expensive to rebuild -- keep them hot longer.
+                expire_seconds = (
+                    USER_PP_DEV_PROFILE_CACHE_TTL_SECONDS
+                    if pp_variant != "stable"
+                    else settings.user_cache_expire_seconds
+                )
             cache_key = self._get_user_cache_key(user_resp["id"], ruleset, pp_variant)
             cached_data = safe_json_dumps(user_resp)
             await self.redis.setex(cache_key, expire_seconds, cached_data)
@@ -485,3 +492,53 @@ async def refresh_user_cache_background(redis: Redis, user_id: int, mode: GameMo
     except Exception as e:
         logger.error(f"Failed to refresh user cache after score submit: {e}")
 
+
+async def prewarm_pp_dev_profile_background(
+    redis: Redis,
+    user_id: int,
+    ruleset: "GameMode | None",
+):
+    """Background task: build and cache the pp_dev user profile if not already cached.
+
+    Called whenever the stable variant is served so that the first pp_dev toggle
+    hits the cache instead of blocking on an inline recalculation.
+    """
+    cache_service = get_user_cache_service(redis)
+    cache_key = cache_service._get_user_cache_key(user_id, ruleset, "pp_dev")
+    try:
+        if await redis.exists(cache_key):
+            return  # already warm
+    except Exception:
+        return
+
+    try:
+        async with with_db() as session:
+            from app.dependencies.fetcher import get_fetcher
+
+            user = await session.get(User, user_id)
+            if user is None or user.id == BANCHOBOT_ID:
+                return
+
+            fetcher = await get_fetcher()
+            effective_mode: GameMode = ruleset or user.playmode
+
+            canonical_user_resp = await UserModel.transform(
+                user,
+                includes=User.USER_INCLUDES,
+                ruleset=ruleset,
+                show_nsfw_media=True,
+            )
+            await apply_pp_variant_to_user_response(
+                session=session,
+                user_resp=canonical_user_resp,
+                user_id=user.id,
+                mode=effective_mode,
+                pp_variant="pp_dev",
+                redis=redis,
+                fetcher=fetcher,
+                country_code=user.country_code,
+            )
+            await cache_service.cache_user(canonical_user_resp, ruleset, pp_variant="pp_dev")
+            logger.debug(f"Pre-warmed pp_dev profile cache for user {user_id} mode={effective_mode}")
+    except Exception as e:
+        logger.warning(f"Failed to pre-warm pp_dev profile for user {user_id}: {e}")

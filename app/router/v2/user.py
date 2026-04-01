@@ -38,7 +38,7 @@ from app.service.pp_variant_service import (
     get_score_pp_variant_batch,
     normalize_pp_variant,
 )
-from app.service.user_cache_service import get_user_cache_service
+from app.service.user_cache_service import get_user_cache_service, prewarm_pp_dev_profile_background
 from app.utils import api_doc, utcnow
 
 from .router import router
@@ -400,14 +400,17 @@ async def get_user_info_ruleset(
 
     user_resp = UserModel.apply_nsfw_media_policy(copy.deepcopy(canonical_user_resp), show_nsfw_media)
 
-    # å¼‚æ­¥ç¼“å­˜ canonical result
+    # å¼‚æ­¥ç¼”å­˜ canonical result
     background_task.add_task(cache_service.cache_user, canonical_user_resp, ruleset, None, resolved_pp_variant)
+    # Pre-warm the pp_dev variant so toggling is instant.
+    if resolved_pp_variant == “stable”:
+        background_task.add_task(prewarm_pp_dev_profile_background, redis, searched_user.id, ruleset)
     return user_resp
 
 
-@router.get("/users/{user_id}/", include_in_schema=False)
+@router.get(“/users/{user_id}/”, include_in_schema=False)
 @router.get(
-    "/users/{user_id}",
+    “/users/{user_id}”,
     name="èŽ·å–ç”¨æˆ·ä¿¡æ¯",
     description="é€šè¿‡ç”¨æˆ· ID æˆ–ç”¨æˆ·åèŽ·å–å•ä¸ªç”¨æˆ·çš„è¯¦ç»†ä¿¡æ¯ã€‚",
     tags=["ç”¨æˆ·"],
@@ -471,8 +474,11 @@ async def get_user_info(
 
     user_resp = UserModel.apply_nsfw_media_policy(copy.deepcopy(canonical_user_resp), show_nsfw_media)
 
-    # å¼‚æ­¥ç¼“å­˜ canonical result
+    # å¼‚æ­¥ç¼”å­˜ canonical result
     background_task.add_task(cache_service.cache_user, canonical_user_resp, None, None, resolved_pp_variant)
+    # Pre-warm the pp_dev variant so toggling is instant.
+    if resolved_pp_variant == “stable”:
+        background_task.add_task(prewarm_pp_dev_profile_background, redis, searched_user.id, None)
     return user_resp
 
 
