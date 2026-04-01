@@ -1162,6 +1162,61 @@ async def process_score(
 
 
 
+_RELAX_AP_MODES = frozenset({GameMode.OSURX, GameMode.TAIKORX, GameMode.FRUITSRX, GameMode.OSUAP})
+_OSU_STANDARD_MODES = frozenset({GameMode.OSU, GameMode.OSURX, GameMode.OSUAP})
+
+
+async def _get_effective_od_cs(score: "Score", session: AsyncSession) -> tuple[float, float] | None:
+    """Return (effective_od, effective_cs) after mod adjustments (DA / HR / EZ).
+    Returns None when the beatmap row cannot be found."""
+    mods = score.mods
+    da_settings: dict = {}
+    for mod in mods:
+        if mod["acronym"] == "DA":
+            da_settings = mod.get("settings", {}) or {}
+            break
+
+    od_override = da_settings.get("overall_difficulty")
+    cs_override = da_settings.get("circle_size")
+
+    # DA fully overrides both — no DB lookup needed.
+    if isinstance(od_override, (int, float)) and isinstance(cs_override, (int, float)):
+        return float(od_override), float(cs_override)
+
+    beatmap = (await session.exec(select(Beatmap).where(Beatmap.id == score.beatmap_id))).first()
+    if beatmap is None:
+        return None
+
+    base_od = float(beatmap.accuracy)  # 'accuracy' column stores OD
+    base_cs = float(beatmap.cs)
+
+    if isinstance(od_override, (int, float)):
+        eff_od = float(od_override)
+    else:
+        eff_od = base_od
+        for mod in mods:
+            if mod["acronym"] == "HR":
+                eff_od = min(10.0, eff_od * 1.4)
+                break
+            elif mod["acronym"] == "EZ":
+                eff_od = eff_od * 0.5
+                break
+
+    if isinstance(cs_override, (int, float)):
+        eff_cs = float(cs_override)
+    else:
+        eff_cs = base_cs
+        for mod in mods:
+            if mod["acronym"] == "HR":
+                eff_cs = min(10.0, eff_cs * 1.3)
+                break
+            elif mod["acronym"] == "EZ":
+                eff_cs = eff_cs * 0.5
+                break
+
+    return eff_od, eff_cs
+
+
 async def _process_score_pp(score: "Score", session: AsyncSession, redis: Redis, fetcher: "Fetcher"):
     if score.pp != 0:
         logger.debug(
@@ -1181,6 +1236,36 @@ async def _process_score_pp(score: "Score", session: AsyncSession, redis: Redis,
             mods=score.mods,
         )
         return
+
+    # Accuracy floor for relax / autopilot modes: < 75% acc → 0 pp.
+    if score.gamemode in _RELAX_AP_MODES and score.accuracy < 0.75:
+        logger.debug(
+            "Skipping PP for score {score_id} | RX/AP acc {acc:.1%} < 75%",
+            score_id=score.id,
+            acc=score.accuracy,
+        )
+        return
+
+    # OD + CS difficulty floor for osu! standard-based modes.
+    if score.gamemode in _OSU_STANDARD_MODES:
+        od_cs = await _get_effective_od_cs(score, session)
+        if od_cs is not None:
+            eff_od, eff_cs = od_cs
+            if eff_od == 0.0 and eff_cs == 0.0:
+                logger.debug(
+                    "Skipping PP for score {score_id} | OD=0 and CS=0",
+                    score_id=score.id,
+                )
+                return
+            if (eff_od + eff_cs) / 2.0 <= 4.0:
+                logger.debug(
+                    "Skipping PP for score {score_id} | (OD={od:.1f}+CS={cs:.1f})/2={avg:.1f} <= 4",
+                    score_id=score.id,
+                    od=eff_od,
+                    cs=eff_cs,
+                    avg=(eff_od + eff_cs) / 2.0,
+                )
+                return
 
     # ✅ 14★ cap (stars AFTER mods). If the map is > 14 stars, it awards 0pp.
     # NOTE: requires: from app.database.beatmap import calculate_beatmap_attributes
