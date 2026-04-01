@@ -54,6 +54,11 @@ from app.models.score import (
 from app.models.version import VersionCheckResult
 from app.service.beatmap_cache_service import get_beatmap_cache_service
 from app.service.login_log_service import LoginLogService
+from app.service.pp_variant_service import (
+    apply_pp_variant_to_score_responses,
+    get_score_pp_variant_batch,
+    normalize_pp_variant,
+)
 from app.service.user_cache_service import refresh_user_cache_background
 from app.utils import api_doc, utcnow
 
@@ -521,12 +526,15 @@ async def get_beatmap_scores(
         ),
     ] = LeaderboardType.GLOBAL,
     limit: Annotated[int, Query(ge=1, le=200, description="返回条数 (1-200)")] = 50,
+    pp_variant: Annotated[str | None, Query(description="pp variant: stable / pp_dev")] = None,
 ):
     # Ensure beatmap exists in local DB, fetch if missing
     try:
         await Beatmap.get_or_fetch(db, fetcher, bid=beatmap_id)
     except Exception as e:
         logger.warning(f"Failed to fetch beatmap {beatmap_id} for leaderboard: {e}")
+
+    resolved_pp_variant = normalize_pp_variant(pp_variant)
 
     show_nsfw_media = await UserModel.viewer_allows_nsfw_media(current_user)
     all_scores, user_score, count = await get_leaderboard(
@@ -539,6 +547,17 @@ async def get_beatmap_scores(
         mods=sorted(mods),
     )
 
+    # Build score responses
+    all_score_resps = [
+        await score.to_resp(
+            db,
+            api_version,
+            includes=DEFAULT_SCORE_INCLUDES,
+            show_nsfw_media=show_nsfw_media,
+        )
+        for score in all_scores
+    ]
+
     user_score_resp = (
         await user_score.to_resp(
             db,
@@ -549,16 +568,36 @@ async def get_beatmap_scores(
         if user_score
         else None
     )
+
+    # Apply pp-dev variant PP values if requested.
+    # Scores are already sorted by stable PP from the leaderboard query;
+    # pp-dev may reorder them visually but we leave the ordering as-is
+    # since the leaderboard position is determined server-side by stable PP.
+    if resolved_pp_variant == "pp_dev":
+        all_scores_for_variant = list(all_scores)
+        if user_score:
+            all_scores_for_variant.append(user_score)
+        all_resps_for_variant = list(all_score_resps)
+        if user_score_resp:
+            all_resps_for_variant.append(user_score_resp)
+
+        pp_by_score_id = await get_score_pp_variant_batch(
+            session=db,
+            scores=all_scores_for_variant,
+            pp_variant=resolved_pp_variant,
+            redis=get_redis(),
+            fetcher=fetcher,
+            recalc_top_n=len(all_scores_for_variant),
+        )
+        apply_pp_variant_to_score_responses(
+            scores=all_scores_for_variant,
+            score_responses=all_resps_for_variant,
+            pp_by_score_id=pp_by_score_id,
+            add_weight=False,
+        )
+
     return {
-        "scores": [
-            await score.to_resp(
-                db,
-                api_version,
-                includes=DEFAULT_SCORE_INCLUDES,
-                show_nsfw_media=show_nsfw_media,
-            )
-            for score in all_scores
-        ],
+        "scores": all_score_resps,
         "user_score": (
             {
                 "score": user_score_resp,
