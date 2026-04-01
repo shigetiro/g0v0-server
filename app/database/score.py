@@ -1166,10 +1166,8 @@ _RELAX_AP_MODES = frozenset({GameMode.OSURX, GameMode.TAIKORX, GameMode.FRUITSRX
 _OSU_STANDARD_MODES = frozenset({GameMode.OSU, GameMode.OSURX, GameMode.OSUAP})
 
 
-async def _get_effective_od_cs(score: "Score", session: AsyncSession) -> tuple[float, float] | None:
-    """Return (effective_od, effective_cs) after mod adjustments (DA / HR / EZ).
-    Returns None when the beatmap row cannot be found."""
-    mods = score.mods
+def _compute_effective_od_cs(mods: list[APIMod], base_od: float, base_cs: float) -> tuple[float, float]:
+    """Pure helper: apply DA / HR / EZ adjustments to base OD and CS."""
     da_settings: dict = {}
     for mod in mods:
         if mod["acronym"] == "DA":
@@ -1178,17 +1176,6 @@ async def _get_effective_od_cs(score: "Score", session: AsyncSession) -> tuple[f
 
     od_override = da_settings.get("overall_difficulty")
     cs_override = da_settings.get("circle_size")
-
-    # DA fully overrides both — no DB lookup needed.
-    if isinstance(od_override, (int, float)) and isinstance(cs_override, (int, float)):
-        return float(od_override), float(cs_override)
-
-    beatmap = (await session.exec(select(Beatmap).where(Beatmap.id == score.beatmap_id))).first()
-    if beatmap is None:
-        return None
-
-    base_od = float(beatmap.accuracy)  # 'accuracy' column stores OD
-    base_cs = float(beatmap.cs)
 
     if isinstance(od_override, (int, float)):
         eff_od = float(od_override)
@@ -1215,6 +1202,30 @@ async def _get_effective_od_cs(score: "Score", session: AsyncSession) -> tuple[f
                 break
 
     return eff_od, eff_cs
+
+
+async def _get_effective_od_cs(score: "Score", session: AsyncSession) -> tuple[float, float] | None:
+    """Return (effective_od, effective_cs) after mod adjustments (DA / HR / EZ).
+    Returns None when the beatmap row cannot be found."""
+    mods = score.mods
+    da_settings: dict = {}
+    for mod in mods:
+        if mod["acronym"] == "DA":
+            da_settings = mod.get("settings", {}) or {}
+            break
+
+    od_override = da_settings.get("overall_difficulty")
+    cs_override = da_settings.get("circle_size")
+
+    # DA fully overrides both — no DB lookup needed.
+    if isinstance(od_override, (int, float)) and isinstance(cs_override, (int, float)):
+        return _compute_effective_od_cs(mods, 0.0, 0.0)
+
+    beatmap = (await session.exec(select(Beatmap).where(Beatmap.id == score.beatmap_id))).first()
+    if beatmap is None:
+        return None
+
+    return _compute_effective_od_cs(mods, float(beatmap.accuracy), float(beatmap.cs))
 
 
 async def _process_score_pp(score: "Score", session: AsyncSession, redis: Redis, fetcher: "Fetcher"):

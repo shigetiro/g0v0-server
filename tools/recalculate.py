@@ -25,7 +25,7 @@ from app.const import BANCHOBOT_ID
 from app.database import TotalScoreBestScore, UserStatistics
 from app.database.beatmap import Beatmap, calculate_beatmap_attributes, clear_cached_beatmap_raws
 from app.database.best_scores import BestScore
-from app.database.score import Score, calculate_playtime, calculate_user_pp
+from app.database.score import Score, _RELAX_AP_MODES, _OSU_STANDARD_MODES, _compute_effective_od_cs, calculate_playtime, calculate_user_pp
 from app.dependencies.database import engine, get_redis
 from app.dependencies.fetcher import get_fetcher
 from app.dependencies.storage import get_storage_service
@@ -690,6 +690,20 @@ async def recalc_score_pp(
             score.pp = 0
             return 0.0
 
+        # Accuracy floor for relax / autopilot modes.
+        if score.gamemode in _RELAX_AP_MODES and score.accuracy < 0.75:
+            score.pp = 0
+            return 0.0
+
+        # OD + CS difficulty floor for osu! standard-based modes.
+        if score.gamemode in _OSU_STANDARD_MODES:
+            eff_od, eff_cs = _compute_effective_od_cs(
+                score.mods, float(beatmap.accuracy), float(beatmap.cs)
+            )
+            if (eff_od == 0.0 and eff_cs == 0.0) or (eff_od + eff_cs) / 2.0 <= 4.0:
+                score.pp = 0
+                return 0.0
+
         try:
             beatmap_raw = await _get_beatmap_raw_for_recalc(fetcher, redis, beatmap)
             # 记录使用的beatmap
@@ -738,6 +752,14 @@ def build_best_scores(user_id: int, gamemode: GameMode, scores: list[Score]) -> 
         ranked = beatmap.beatmap_status.has_pp() | settings.enable_all_beatmap_pp
         if not ranked or not mods_can_get_pp(int(score.gamemode), score.mods):
             continue
+        if score.gamemode in _RELAX_AP_MODES and score.accuracy < 0.75:
+            continue
+        if score.gamemode in _OSU_STANDARD_MODES:
+            eff_od, eff_cs = _compute_effective_od_cs(
+                score.mods, float(beatmap.accuracy), float(beatmap.cs)
+            )
+            if (eff_od == 0.0 and eff_cs == 0.0) or (eff_od + eff_cs) / 2.0 <= 4.0:
+                continue
         if not score.pp or score.pp <= 0:
             continue
         current_best = best_per_map.get(score.beatmap_id)
