@@ -1,7 +1,8 @@
-from . import (  # noqa: F401
+from . import ( # noqa: F401
     beatmap,
     beatmapset,
     changelog,
+    client_logs,
     me,
     misc,
     ranking,
