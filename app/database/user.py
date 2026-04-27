@@ -122,6 +122,7 @@ class UserDict(TypedDict):
     is_gmt: NotRequired[bool]
     is_qat: NotRequired[bool]
     is_bng: NotRequired[bool]
+    is_dev: NotRequired[bool]
     groups: NotRequired[list[str]]
     active_tournament_banners: NotRequired[list[dict]]
     graveyard_beatmapset_count: NotRequired[int]
@@ -240,6 +241,7 @@ class UserModel(DatabaseModel[UserDict]):
         "country",
         "is_admin",
         "is_bng",
+        "is_dev",
         "is_full_bn",
         "is_gmt",
         "is_limited_bn",
@@ -357,6 +359,7 @@ class UserModel(DatabaseModel[UserDict]):
     is_gmt: OnDemand[bool] = Field(default=False)
     is_qat: OnDemand[bool] = Field(default=False)
     is_bng: OnDemand[bool] = Field(default=False)
+    is_dev: OnDemand[bool] = Field(default=False)
 
     # g0v0-extra
     g0v0_playmode: GameMode = GameMode.OSU
@@ -517,7 +520,7 @@ class UserModel(DatabaseModel[UserDict]):
     async def is_admin(_session, obj: "User") -> bool:
         return bool(getattr(obj, "is_admin", False))
 
-    # @ondemand
+        # @ondemand
     # @staticmethod
     # async def is_admin(_session, obj: "User") -> bool:
     #     return bool(getattr(obj, "is_admin", False))
