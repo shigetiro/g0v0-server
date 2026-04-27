@@ -34,6 +34,7 @@ from .counts import (
     ReplayWatchedCount,
 )
 from .daily_challenge import DailyChallengeStats, DailyChallengeStatsResp
+from .daily_challenge_model import DailyChallenge, DailyChallengeCreate, DailyChallengeResponse, DailyChallengeUpdate
 from .events import Event
 from .favourite_beatmapset import FavouriteBeatmapset
 from .item_attempts_count import (
@@ -109,8 +110,12 @@ __all__ = [
     "ChatMessageDict",
     "ChatMessageModel",
     "CountResp",
+    "DailyChallenge",
+    "DailyChallengeCreate",
+    "DailyChallengeResponse",
     "DailyChallengeStats",
     "DailyChallengeStatsResp",
+    "DailyChallengeUpdate",
     "EmailVerification",
     "Event",
     "FavouriteBeatmapset",

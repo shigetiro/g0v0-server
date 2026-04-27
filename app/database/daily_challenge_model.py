@@ -1,15 +1,15 @@
 from datetime import date as dt_date, datetime
 from typing import Any
 
-from sqlmodel import Field, SQLModel
+from sqlmodel import BigInteger, Field, SQLModel
 
 
 class DailyChallengeBase(SQLModel):
-    beatmap_id: int
+    beatmap_id: int = Field(sa_column=Field(BigInteger))
     ruleset_id: int
     required_mods: str
     allowed_mods: str
-    room_id: int | None = None
+    room_id: int | None = Field(default=None, sa_column=Field(BigInteger))
     max_attempts: int | None = None
     time_limit: int | None = None
 
@@ -38,6 +38,6 @@ class DailyChallengeUpdate(SQLModel):
 
 class DailyChallengeResponse(DailyChallengeBase):
     date: dt_date
-    created_at: datetime
-    updated_at: datetime
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
     beatmap: dict[str, Any] | None = None

@@ -1,4 +1,4 @@
-from datetime import UTC
+from datetime import UTC, date as dt_date
 from typing import Annotated, Literal
 
 from app.database.beatmap import (
@@ -6,6 +6,8 @@ from app.database.beatmap import (
     BeatmapModel,
 )
 from app.database.beatmapset import BeatmapsetModel
+from app.database.daily_challenge import DailyChallengeStats
+from app.database.daily_challenge_model import DailyChallenge
 from app.database.item_attempts_count import ItemAttemptsCount, ItemAttemptsCountModel
 from app.database.multiplayer_event import MultiplayerEvent, MultiplayerEventResp
 from app.database.playlists import Playlist, PlaylistModel
@@ -22,9 +24,33 @@ from app.utils import api_doc, utcnow
 from .router import router
 
 from fastapi import HTTPException, Path, Query, Security
+from pydantic import BaseModel
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import col, exists, select
 from sqlmodel.ext.asyncio.session import AsyncSession
+
+
+class DailyChallengeInfoResponse(BaseModel):
+    """Daily challenge info for osu!lazer client - matches DailyChallengeInfo struct"""
+    room_id: int
+    beatmap_id: int
+    ruleset_id: int
+    start_time: str
+    end_time: str
+
+
+class DailyChallengeStatsPublicResponse(BaseModel):
+    """Public daily challenge stats for a user - matches APIUserDailyChallengeStatistics"""
+    user_id: int
+    daily_streak_best: int
+    daily_streak_current: int
+    weekly_streak_best: int
+    weekly_streak_current: int
+    top_10p_placements: int
+    top_50p_placements: int
+    playcount: int
+    last_update: str | None = None
+    last_weekly_streak: str | None = None
 
 
 @router.get(
@@ -468,3 +494,124 @@ async def get_room_events(
         "room": room_resp,
         "user": user_resps,
     }
+
+
+@router.get("/daily-challenge/current", tags=["每日挑战"], name="获取当前每日挑战", description="获取当前活跃的每日挑战房间信息")
+async def get_daily_challenge_current(
+    db: Database,
+    current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
+):
+    """Get current active daily challenge room info (for osu!lazer client)"""
+    now = utcnow()
+    room = (await db.exec(
+        select(Room).where(
+            Room.category == RoomCategory.DAILY_CHALLENGE,
+            col(Room.ends_at) > now,
+        )
+    )).first()
+
+    if room is None:
+        raise HTTPException(404, "No active daily challenge found")
+
+    # Get the daily challenge details
+    challenge = (await db.exec(
+        select(DailyChallenge).where(col(DailyChallenge.room_id) == room.id)
+    )).first()
+
+    if challenge is None:
+        raise HTTPException(404, "Daily challenge details not found")
+
+    return DailyChallengeInfoResponse(
+        room_id=room.id,
+        beatmap_id=challenge.beatmap_id,
+        ruleset_id=challenge.ruleset_id,
+        start_time=room.starts_at.isoformat() if room.starts_at else now.isoformat(),
+        end_time=room.ends_at.isoformat() if room.ends_at else now.isoformat(),
+    )
+
+
+@router.get("/daily-challenge/scores", tags=["每日挑战"], name="获取每日挑战分数", description="获取指定日期每日挑战的排行榜")
+async def get_daily_challenge_scores(
+    db: Database,
+    current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
+    date: Annotated[dt_date | None, Query(description="日期 (YYYY-MM-DD)，为空则返回今日")] = None,
+    page: Annotated[int, Query(ge=1, description="页码")] = 1,
+):
+    """Get scores for a daily challenge (for osu!lazer client leaderboard)"""
+    from app.database.playlist_best_score import PlaylistBestScore
+    from app.database.user import UserModel
+
+    target_date = date or utcnow().date()
+
+    # Find the daily challenge for this date
+    challenge = (await db.exec(
+        select(DailyChallenge).where(col(DailyChallenge.date) == target_date)
+    )).first()
+
+    if challenge is None:
+        raise HTTPException(404, f"No daily challenge found for date {target_date}")
+
+    room_id = challenge.room_id
+
+    page_size = 50
+    start_idx = (page - 1) * page_size
+
+    # Get scores ordered by total_score descending
+    scores_result = (await db.exec(
+        select(PlaylistBestScore)
+        .where(
+            PlaylistBestScore.room_id == room_id,
+            PlaylistBestScore.playlist_id == 0,
+        )
+        .order_by(col(PlaylistBestScore.total_score).desc())
+        .limit(page_size)
+        .offset(start_idx)
+    )).all()
+
+    # Transform scores
+    score_resps = []
+    for i, score in enumerate(scores_result):
+        score_dict = await score.to_dict(includes=["user", "beatmap"])
+        score_dict["rank"] = start_idx + i + 1
+        score_resps.append(score_dict)
+
+    return {
+        "scores": score_resps,
+        "date": target_date.isoformat(),
+    }
+
+
+@router.get("/daily-challenge/{user_id}/stats", tags=["每日挑战"], name="获取用户每日挑战统计", description="获取用户的每日挑战统计数据 (公开查看)")
+async def get_user_daily_challenge_stats(
+    db: Database,
+    current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
+    user_id: Annotated[int, Path(..., description="用户 ID")],
+):
+    """Get daily challenge statistics for a user (public - matches APIUserDailyChallengeStatistics)"""
+    stats = await db.get(DailyChallengeStats, user_id)
+
+    if stats is None:
+        # Return default empty stats
+        return DailyChallengeStatsPublicResponse(
+            user_id=user_id,
+            daily_streak_best=0,
+            daily_streak_current=0,
+            weekly_streak_best=0,
+            weekly_streak_current=0,
+            top_10p_placements=0,
+            top_50p_placements=0,
+            playcount=0,
+        )
+
+    return DailyChallengeStatsPublicResponse(
+        user_id=user_id,
+        daily_streak_best=stats.daily_streak_best,
+        daily_streak_current=stats.daily_streak_current,
+        weekly_streak_best=stats.weekly_streak_best,
+        weekly_streak_current=stats.weekly_streak_current,
+        top_10p_placements=stats.top_10p_placements,
+        top_50p_placements=stats.top_50p_placements,
+        playcount=stats.playcount,
+        last_update=stats.last_update.isoformat() if stats.last_update else None,
+        last_weekly_streak=stats.last_weekly_streak.isoformat() if stats.last_weekly_streak else None,
+    )

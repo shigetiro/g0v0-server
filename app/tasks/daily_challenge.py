@@ -96,12 +96,13 @@ async def daily_challenge_job():
             allowed_mods_list = get_available_mods(ruleset_id_int, required_mods_list)
 
         next_day = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        duration = max(0, min(1440, int((next_day - now - timedelta(minutes=2)).total_seconds() / 60)))
         room = await create_daily_challenge_room(
             beatmap=beatmap_int,
             ruleset_id=ruleset_id_int,
             required_mods=required_mods_list,
             allowed_mods=allowed_mods_list,
-            duration=int((next_day - now - timedelta(minutes=2)).total_seconds() / 60),
+            duration=duration,
         )
         logger.success(f"Added today's daily challenge: {beatmap=}, {ruleset_id=}, {required_mods=}")
         return
@@ -143,21 +144,18 @@ async def process_daily_challenge_top():
                 )
             ).all()
             total_score_count = len(scores)
-            s = []
             for i, score in enumerate(scores):
                 stats = await session.get(DailyChallengeStats, score.user_id)
                 if stats is None:  # not execute
                     continue
                 if stats.last_update is None or stats.last_update.replace(tzinfo=UTC).date() != now.date():
-                    if total_score_count < 10 or ceil(i + 1 / total_score_count) <= 0.1:
+                    if total_score_count < 10 or ceil((i + 1) / total_score_count) <= 0.1:
                         stats.top_10p_placements += 1
-                    if total_score_count < 2 or ceil(i + 1 / total_score_count) <= 0.5:
+                    if total_score_count < 2 or ceil((i + 1) / total_score_count) <= 0.5:
                         stats.top_50p_placements += 1
-                s.append(s)
                 participated_users.append(score.user_id)
                 stats.last_update = now
             await session.commit()
-            del s
 
         user_ids = (await session.exec(select(User.id).where(col(User.id).not_in(participated_users)))).all()
         for id in user_ids:
@@ -166,7 +164,7 @@ async def process_daily_challenge_top():
                 continue
             stats.daily_streak_current = 0
             if stats.last_weekly_streak and not are_same_weeks(
-                stats.last_weekly_streak.replace(tzinfo=UTC), now - timedelta(days=7)
+                stats.last_weekly_streak.replace(tzinfo=UTC), now
             ):
                 stats.weekly_streak_current = 0
             stats.last_update = now
