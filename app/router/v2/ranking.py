@@ -638,4 +638,101 @@ async def get_user_ranking(
     }
 
 
+class TopPlaysResponse(BaseModel):
+    scores: list[dict[str, Any]]
+    total: int
+
+
+@router.get(
+    "/rankings/{ruleset}/top-plays",
+    response_model=TopPlaysResponse,
+    name="获取高分成绩排行",
+    description="获取指定模式下按PP排序的最高分成绩",
+    tags=["排行榜"],
+)
+async def get_top_plays_ranking(
+    session: Database,
+    background_tasks: BackgroundTasks,
+    ruleset: Annotated[GameMode, Path(..., description="指定 ruleset")],
+    current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
+    page: Annotated[int, Query(ge=1, description="页码")] = 1,
+):
+    from app.database.score import Score
+    from app.database.beatmap import Beatmap
+    from app.database.beatmapset import Beatmapset
+
+    redis = get_redis()
+    cache_service = get_ranking_cache_service(redis)
+
+    # Try to get from cache first
+    cached_data = await cache_service.get_cached_top_plays(ruleset, page)
+    cached_stats = await cache_service.get_cached_top_plays_stats(ruleset)
+
+    if cached_data is not None and cached_stats is not None:
+        return TopPlaysResponse(
+            scores=cached_data,
+            total=cached_stats.get("total", 0),
+        )
+
+    page_size = 50
+    start_idx = (page - 1) * page_size
+
+    scores_result = await session.exec(
+        select(Score)
+        .where(
+            Score.ruleset_id == int(ruleset),
+            Score.pp > 0,
+            Score.passed == True,
+            Score.ranked == True,
+        )
+        .order_by(col(Score.pp).desc())
+        .limit(page_size)
+        .offset(start_idx)
+        .options(
+            joinedload(Score.beatmap),
+            joinedload(Score.beatmapset),
+            joinedload(Score.user),
+        )
+    )
+    scores = scores_result.unique().all()
+
+    count_result = await session.exec(
+        select(func.count()).select_from(Score).where(
+            Score.ruleset_id == int(ruleset),
+            Score.pp > 0,
+            Score.passed == True,
+            Score.ranked == True,
+        )
+    )
+    total_count = count_result.one()
+
+    scores_data = []
+    for score in scores:
+        score_dict = await score.to_dict(
+            includes=["beatmap", "beatmapset", "user.country", "user.cover"]
+        )
+        scores_data.append(score_dict)
+
+    cache_scores = scores_data
+    stats_data = {"total": total_count}
+
+    background_tasks.add_task(
+        cache_service.cache_top_plays,
+        ruleset,
+        cache_scores,
+        page,
+        ttl=settings.ranking_cache_expire_minutes * 60,
+    )
+
+    background_tasks.add_task(
+        cache_service.cache_top_plays_stats,
+        ruleset,
+        stats_data,
+        ttl=settings.ranking_cache_expire_minutes * 60,
+    )
+
+    return TopPlaysResponse(
+        scores=scores_data,
+        total=total_count,
+    )
 

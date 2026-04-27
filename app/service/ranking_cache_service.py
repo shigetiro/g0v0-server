@@ -296,6 +296,73 @@ class RankingCacheService:
         except Exception as e:
             logger.error(f"Error caching country stats: {e}")
 
+    def _get_top_plays_cache_key(self, ruleset: GameMode, page: int = 1) -> str:
+        """生成最高分数缓存键"""
+        return f"top_plays:{ruleset}:page:{page}"
+
+    def _get_top_plays_stats_cache_key(self, ruleset: GameMode) -> str:
+        """生成最高分数统计信息缓存键"""
+        return f"top_plays:stats:{ruleset}"
+
+    async def get_cached_top_plays(self, ruleset: GameMode, page: int = 1) -> list[dict] | None:
+        """获取缓存的最高分数据"""
+        try:
+            cache_key = self._get_top_plays_cache_key(ruleset, page)
+            cached_data = await self.redis.get(cache_key)
+
+            if cached_data:
+                return json.loads(cached_data)
+            return None
+        except Exception as e:
+            logger.error(f"Error getting cached top plays: {e}")
+            return None
+
+    async def cache_top_plays(
+        self,
+        ruleset: GameMode,
+        scores_data: list[dict],
+        page: int = 1,
+        ttl: int | None = None,
+    ) -> None:
+        """缓存最高分数据"""
+        try:
+            cache_key = self._get_top_plays_cache_key(ruleset, page)
+            if ttl is None:
+                ttl = settings.ranking_cache_expire_minutes * 60
+            await self.redis.set(cache_key, safe_json_dumps(scores_data), ex=ttl)
+            logger.debug(f"Cached top plays for {cache_key}")
+        except Exception as e:
+            logger.error(f"Error caching top plays: {e}")
+
+    async def get_cached_top_plays_stats(self, ruleset: GameMode) -> dict | None:
+        """获取缓存的最高分统计信息"""
+        try:
+            cache_key = self._get_top_plays_stats_cache_key(ruleset)
+            cached_data = await self.redis.get(cache_key)
+
+            if cached_data:
+                return json.loads(cached_data)
+            return None
+        except Exception as e:
+            logger.error(f"Error getting cached top plays stats: {e}")
+            return None
+
+    async def cache_top_plays_stats(
+        self,
+        ruleset: GameMode,
+        stats: dict,
+        ttl: int | None = None,
+    ) -> None:
+        """缓存最高分统计信息"""
+        try:
+            cache_key = self._get_top_plays_stats_cache_key(ruleset)
+            if ttl is None:
+                ttl = settings.ranking_cache_expire_minutes * 60 * 6
+            await self.redis.set(cache_key, safe_json_dumps(stats), ex=ttl)
+            logger.debug(f"Cached top plays stats for {cache_key}")
+        except Exception as e:
+            logger.error(f"Error caching top plays stats: {e}")
+
     async def refresh_ranking_cache(
         self,
         session: AsyncSession,
