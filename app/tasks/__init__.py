@@ -14,6 +14,7 @@ from .create_banchobot import create_banchobot
 from .daily_challenge import daily_challenge_job, process_daily_challenge_top
 from .geoip import init_geoip
 from .load_achievements import load_achievements
+from .recalculation_worker import start_recalculation_worker, stop_recalculation_worker
 from .special_statistics import create_custom_ruleset_statistics, create_rx_statistics
 
 __all__ = [
@@ -26,5 +27,7 @@ __all__ = [
     "load_achievements",
     "process_daily_challenge_top",
     "start_cache_tasks",
+    "start_recalculation_worker",
     "stop_cache_tasks",
+    "stop_recalculation_worker",
 ]

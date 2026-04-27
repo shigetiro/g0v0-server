@@ -36,7 +36,6 @@ from app.router import (
     redirect_api_router,
 )
 from app.router.redirect import redirect_router
-from app.router.status import router as status_router
 from app.router.v1 import api_v1_public_router
 from app.service.beatmap_download_service import download_service
 from app.service.beatmapset_update_service import init_beatmapset_update_service
@@ -54,7 +53,9 @@ from app.tasks import (
     load_achievements,
     process_daily_challenge_top,
     start_cache_tasks,
+    start_recalculation_worker,
     stop_cache_tasks,
+    stop_recalculation_worker,
 )
 from app.utils import bg_tasks, utcnow
 
@@ -105,9 +106,8 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     # services
     await start_email_processor()
     await download_service.start_health_check()
-    from app.router.status import start_collector as _start_status_collector
-    await _start_status_collector()
     await start_cache_tasks()
+    start_recalculation_worker()
     init_beatmapset_update_service(fetcher)  # 初始化谱面集更新服务
     redis_message_system.start()
     start_scheduler()
@@ -208,7 +208,6 @@ app.include_router(api_v2_router)
 app.include_router(api_v1_router)
 app.include_router(api_v1_public_router)
 app.include_router(chat_router)
-app.include_router(status_router)
 app.include_router(redirect_api_router)
 # app.include_router(fetcher_router)
 app.include_router(file_router)
