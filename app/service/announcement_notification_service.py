@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 
 from app.const import BANCHOBOT_ID
-from app.database import Database
+from app.dependencies.database import Database
 from app.database.announcement import Announcement, AnnouncementType
 from app.database.user import User
 from app.models.notification import GlobalAnnouncement
