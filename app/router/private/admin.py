@@ -30,7 +30,7 @@ from app.dependencies.storage import StorageService
 from app.dependencies.user import UserAndToken, get_client_user_and_token
 from app.models.mods import APIMod, get_available_mods
 from app.models.score import GameMode
-from app.models.notification import ChannelMessage, GlobalAnnouncement
+from app.models.notification import ChannelMessage, GlobalAnnouncement, UserAchievementUnlock
 from app.router.notification.server import server
 from app.service.ranking_cache_service import get_ranking_cache_service
 from app.service.recalculation_service import is_recalculation_running, has_pending_or_running_task, check_concurrent_limit, get_current_task_status
@@ -45,6 +45,7 @@ router = APIRouter()
 import json
 import httpx
 import hashlib
+import time
 from fastapi import File, Form, HTTPException, Query, Security
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.exc import IntegrityError
@@ -367,6 +368,7 @@ class GlobalAnnouncementReq(BaseModel):
     severity: str = "warning"
     also_send_pm: bool = True
     online_only: bool = True
+    show_popup: bool = True  # Show as medal popup (for small announcements)
     sender_username: str | None = None
     sender_user_id: int | None = None
 
@@ -932,6 +934,23 @@ async def send_global_announcement(
         receiver_ids=receivers,
     )
     await server.new_private_notification(announcement)
+
+    # Also send as fake achievement unlock to trigger MedalOverlay popup
+    # This is a hack to show announcements since osu!lazer only shows popups for achievements
+    if req.show_popup:
+        for user_id in receivers:
+            # Use a unique achievement ID for each send (based on timestamp and user_id)
+            fake_achievement_id = int(time.time_ns() % 1000000000) + user_id
+            fake_achievement = UserAchievementUnlock(
+                achievement_id=fake_achievement_id,
+                achievement_mode="osu",  # Standard mode
+                cover_url="https://a.g0v0.top/-/default-avatar.jpg",  # Use default avatar as cover
+                slug="announcement",
+                title=req.title.strip() or "Server Announcement",
+                description=message[:150] if len(message) <= 150 else message[:147] + "...",  # Truncate for medal display
+                user_id=user_id,
+            )
+            await server.new_private_notification(fake_achievement)
 
     if req.also_send_pm and receivers:
         targets = (
@@ -3555,6 +3574,10 @@ async def create_announcement(
     """Create a new announcement (admin only)"""
     current_user = await require_admin(session, user_and_token)
 
+    # Capture user attributes immediately to avoid lazy-loading issues after commit
+    current_user_id = current_user.id
+    current_username = current_user.username
+
     new_announcement = Announcement(
         title=announcement_data.title,
         content=announcement_data.content,
@@ -3566,9 +3589,12 @@ async def create_announcement(
         is_pinned=announcement_data.is_pinned,
         show_in_client=announcement_data.show_in_client,
         show_on_website=announcement_data.show_on_website,
-        created_by=current_user.id,
+        created_by=current_user_id,
         metadata=announcement_data.metadata,
     )
+
+    # Capture username BEFORE commit to avoid lazy-loading issues
+    created_by_username = current_user.username
 
     session.add(new_announcement)
     await session.commit()
@@ -3581,14 +3607,14 @@ async def create_announcement(
             await trigger_announcement_notification(
                 session=session,
                 announcement=new_announcement,
-                current_user_id=current_user.id,
+                current_user_id=current_user_id,
                 online_only=False,
             )
         except Exception as e:
             logger.error(f"Failed to send notification for new announcement {new_announcement.id}: {e}")
 
     announcement_dict = new_announcement.model_dump()
-    announcement_dict["created_by_username"] = current_user.username
+    announcement_dict["created_by_username"] = created_by_username
 
     return AnnouncementResponse(**announcement_dict)
 
@@ -3637,13 +3663,32 @@ async def update_announcement(
 
     announcement.updated_at = datetime.utcnow()
 
+    # Check if announcement is being activated and should show in client
+    was_inactive = not announcement.is_active
+
     await session.commit()
     await session.refresh(announcement)
 
-    # Get creator username
+    # Send notification if announcement was activated and should be shown in client
+    if was_inactive and announcement.is_active and announcement.show_in_client:
+        try:
+            from app.service.announcement_notification_service import trigger_announcement_notification
+
+            await trigger_announcement_notification(
+                session=session,
+                announcement=announcement,
+                current_user_id=announcement.created_by,
+                online_only=False,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send notification for activated announcement {announcement.id}: {e}")
+
+    # Get creator username (use fresh session lookup to avoid lazy-load issues)
     creator = await session.get(User, announcement.created_by)
+    creator_username = creator.username if creator else None
+
     announcement_dict = announcement.model_dump()
-    announcement_dict["created_by_username"] = creator.username if creator else None
+    announcement_dict["created_by_username"] = creator_username
 
     return AnnouncementResponse(**announcement_dict)
 
@@ -3687,9 +3732,14 @@ async def activate_announcement(
 
     current_user = await require_admin(session, user_and_token)
 
+    # Capture user attributes immediately to avoid lazy-loading issues after commit
+    current_user_id = current_user.id
+
     announcement = await session.get(Announcement, announcement_id)
     if not announcement:
         raise HTTPException(status_code=404, detail="Announcement not found")
+
+    was_inactive = not announcement.is_active
 
     announcement.is_active = True
     announcement.updated_at = datetime.utcnow()
@@ -3699,12 +3749,12 @@ async def activate_announcement(
 
     # Send notification if requested and announcement should be shown in client
     notification_id = None
-    if send_notification and announcement.show_in_client:
+    if was_inactive and send_notification and announcement.show_in_client:
         try:
             notification_id = await trigger_announcement_notification(
                 session=session,
                 announcement=announcement,
-                current_user_id=current_user.id,
+                current_user_id=current_user_id,
                 online_only=online_only,
             )
         except Exception as e:
@@ -3883,7 +3933,7 @@ async def schedule_maintenance_mode(
 ):
     """Set maintenance mode with optional countdown timer (dev or admin only)"""
     from app.database.announcement import Announcement, AnnouncementType
-    from app.service.announcement_notification_service import AnnouncementNotificationService
+    from app.service.announcement_notification_service import trigger_announcement_notification
 
     current_user = await require_dev_or_admin(session, user_and_token)
 
@@ -3920,9 +3970,6 @@ async def schedule_maintenance_mode(
             updated_at=datetime.utcnow().isoformat(),
         )
 
-    # Creating announcement service
-    announcement_service = AnnouncementNotificationService(session)
-
     # If countdown requested
     if request.schedule_minutes and request.schedule_minutes > 0:
         end_time = datetime.utcnow() + timedelta(minutes=request.schedule_minutes)
@@ -3938,7 +3985,7 @@ async def schedule_maintenance_mode(
             is_active=True,
             start_at=datetime.utcnow(),
             end_at=end_time + timedelta(minutes=1),
-            created_by=current_user.id,
+            created_by=current_user_id,
         )
         session.add(countdown_announcement)
         await session.commit()
@@ -3962,7 +4009,7 @@ async def schedule_maintenance_mode(
             is_active=False,  # Will be activated when countdown hits 0
             start_at=end_time,
             end_at=None,
-            created_by=current_user.id,
+            created_by=current_user_id,
         )
         session.add(maintenance_announcement)
         await session.commit()
@@ -3971,7 +4018,7 @@ async def schedule_maintenance_mode(
         _scheduled_maintenance["maintenance_announcement_id"] = maintenance_announcement.id
 
         # Broadcast the countdown announcement
-        await announcement_service.broadcast_announcement(countdown_announcement)
+        await trigger_announcement_notification(session, countdown_announcement, current_user_id)
 
         return MaintenanceModeScheduleResponse(
             enabled=False,  # Not yet enabled
@@ -4019,7 +4066,7 @@ async def schedule_maintenance_mode(
         is_active=True,
         start_at=now,
         end_at=None,
-        created_by=current_user.id,
+        created_by=current_user_id,
     )
     session.add(maintenance_announcement)
     await session.commit()
@@ -4029,7 +4076,7 @@ async def schedule_maintenance_mode(
     _scheduled_maintenance["maintenance_announcement_id"] = maintenance_announcement_id
 
     # Broadcast the announcement
-    await announcement_service.broadcast_announcement(maintenance_announcement)
+    await trigger_announcement_notification(session, maintenance_announcement, current_user.id)
 
     return MaintenanceModeScheduleResponse(
         enabled=True,
@@ -4096,7 +4143,7 @@ async def recalculate_user(
         task_type=RecalculationType.USER,
         target_id=user_id,
         status=RecalculationStatus.PENDING,
-        created_by=current_user.id,
+        created_by=current_user_id,
     )
     session.add(task)
     await session.commit()
@@ -4163,7 +4210,7 @@ async def recalculate_beatmap(
         task_type=RecalculationType.BEATMAP,
         target_id=beatmap_id,
         status=RecalculationStatus.PENDING,
-        created_by=current_user.id,
+        created_by=current_user_id,
     )
     session.add(task)
     await session.commit()
@@ -4211,7 +4258,7 @@ async def recalculate_overall(
     task = RecalculationTask(
         task_type=RecalculationType.OVERALL,
         status=RecalculationStatus.PENDING,
-        created_by=current_user.id,
+        created_by=current_user_id,
     )
     session.add(task)
     await session.commit()
@@ -4478,7 +4525,11 @@ async def get_client_version_stats(
     user_and_token: Annotated[UserAndToken, Security(get_client_user_and_token)],
     time_range: str = Query("7d"),
 ):
-    """Get client version statistics (admin only)"""
+    """Get client version statistics (admin only)
+
+    Aggregates data from both client_logs and score_tokens to show
+    version statistics regardless of whether explicit logs were submitted.
+    """
     await require_admin(session, user_and_token)
 
     # Calculate time range
@@ -4490,16 +4541,20 @@ async def get_client_version_stats(
     }
     time_delta = time_delta_map.get(time_range, timedelta(days=7))
 
-    # Build query
+    # Build query - aggregate from score_tokens which always has client_version
+    from app.database.score import ScoreToken
     query = select(
-        ClientLog.client_version,
-        func.count(ClientLog.id).label("count"),
-        func.max(ClientLog.created_at).label("last_seen"),
-    ).group_by(ClientLog.client_version)
+        ScoreToken.client_version,
+        func.count(ScoreToken.id).label("count"),
+        func.max(ScoreToken.created_at).label("last_seen"),
+    ).where(
+        col(ScoreToken.client_version).is_not(None),
+        col(ScoreToken.client_version) != "",
+    ).group_by(ScoreToken.client_version)
 
     if time_delta:
         cutoff_time = datetime.utcnow() - time_delta
-        query = query.where(col(ClientLog.created_at) >= cutoff_time)
+        query = query.where(col(ScoreToken.created_at) >= cutoff_time)
 
     results = (await session.exec(query)).all()
 
