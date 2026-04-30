@@ -875,6 +875,11 @@ async def send_global_announcement(
     user_and_token: Annotated[UserAndToken, Security(get_client_user_and_token)],
 ):
     """Send a global in-app announcement, optionally mirrored as PM from a bot/admin account."""
+    # Debug logging
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Global announcement request: show_popup={req.show_popup}, online_only={req.online_only}, also_send_pm={req.also_send_pm}")
+    logger.info(f"Request data: {req.model_dump()}")
     current_user = await require_admin(session, user_and_token)
 
     message = req.message.strip()
@@ -3946,6 +3951,22 @@ async def schedule_maintenance_mode(
     if not request.enabled:
         _scheduled_maintenance["active"] = False
         _scheduled_maintenance["end_time"] = None
+        # Update the maintenance_mode setting to false in DB
+        setting = (await session.exec(select(SystemSetting).where(SystemSetting.key == "maintenance_mode"))).first()
+        if setting:
+            setting.value = "false"
+            setting.updated_by = current_user.id
+            setting.updated_at = datetime.utcnow()
+        else:
+            setting = SystemSetting(
+                key="maintenance_mode",
+                value="false",
+                value_type="bool",
+                updated_by=current_user.id,
+                updated_at=datetime.utcnow(),
+            )
+            session.add(setting)
+            await session.commit()
 
         # Deactivate any active maintenance announcements
         active_announcements = (
