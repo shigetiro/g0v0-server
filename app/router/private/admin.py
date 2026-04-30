@@ -344,6 +344,7 @@ class BeatmapBlacklistItem(BaseModel):
     beatmapset_id: int
     beatmap_id: int
     beatmapset: dict | None = None
+    beatmap: dict | None = None
 
 
 class BadgeCreateRequest(BaseModel):
@@ -1939,7 +1940,6 @@ async def get_blacklisted_beatmaps(
     ).all()
 
     result = []
-    seen_beatmapsets = set()
 
     for banned_item in banned_beatmaps:
         # Get the beatmap to find its beatmapset
@@ -1949,25 +1949,35 @@ async def get_blacklisted_beatmaps(
 
         beatmapset_id = beatmap.beatmapset_id
 
-        # Only add each beatmapset once
-        if beatmapset_id in seen_beatmapsets:
-            continue
-        seen_beatmapsets.add(beatmapset_id)
-
         beatmapset = await session.get(Beatmapset, beatmapset_id)
         beatmapset_dict = None
         if beatmapset:
             beatmapset_dict = {
                 "id": beatmapset.id,
-                "title": beatmapset.title,
-                "artist": beatmapset.artist,
+                "title": beatmapset.title or "Unknown",
+                "artist": beatmapset.artist or "Unknown",
             }
+
+        # Safely get beatmap properties with fallbacks
+        beatmap_dict = {
+            "id": beatmap.id,
+            "version": getattr(beatmap, 'version', 'Unknown') or 'Unknown',
+            "difficulty_rating": float(getattr(beatmap, 'difficulty_rating', 0.0) or 0.0),
+            "mode": str(getattr(beatmap, 'mode', 'Unknown') or 'Unknown'),
+            "total_length": int(getattr(beatmap, 'total_length', 0) or 0),
+            "bpm": float(getattr(beatmap, 'bpm', 0.0) or 0.0),
+            "count_circles": int(getattr(beatmap, 'count_circles', 0) or 0),
+            "count_sliders": int(getattr(beatmap, 'count_sliders', 0) or 0),
+            "count_spinners": int(getattr(beatmap, 'count_spinners', 0) or 0),
+        }
+
         result.append(
             BeatmapBlacklistItem(
                 id=banned_item.id or 0,
                 beatmapset_id=beatmapset_id,
                 beatmap_id=banned_item.beatmap_id,
                 beatmapset=beatmapset_dict,
+                beatmap=beatmap_dict,
             )
         )
 
@@ -2015,17 +2025,18 @@ async def add_blacklisted_beatmap(
         if existing_banned:
             raise HTTPException(status_code=400, detail="Beatmap is already blacklisted")
 
+        beatmapset_id_value = getattr(beatmap, 'beatmapset_id', 0) or 0
+
         session.add(BannedBeatmaps(beatmap_id=beatmap_id))
         await session.commit()
         return {
             "beatmap_id": beatmap_id,
-            "beatmapset_id": beatmap.beatmapset_id,
+            "beatmapset_id": beatmapset_id_value,
             "message": "Beatmap added to blacklist",
         }
 
-    beatmapset_id = request.beatmapset_id
-    if beatmapset_id is None:
-        raise HTTPException(status_code=422, detail="beatmapset_id is required")
+    elif request.beatmapset_id is not None:
+        beatmapset_id = request.beatmapset_id
 
     # Verify beatmapset exists
     beatmapset = await session.get(Beatmapset, beatmapset_id)
