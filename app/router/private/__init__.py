@@ -5,6 +5,7 @@ from . import (  # noqa: F401
     audio_proxy,
     avatar,
     beatmapset,
+    changelog,
     cover,
     oauth,
     password,
