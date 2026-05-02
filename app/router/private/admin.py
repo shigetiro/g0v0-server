@@ -1,59 +1,86 @@
 from __future__ import annotations
-from datetime import datetime, timedelta
-from typing import Annotated, cast, Any
 
+from datetime import datetime, timedelta
+from typing import Annotated, Any, cast
+
+from app.const import BANCHOBOT_ID
+from app.database.announcement import (
+    Announcement,
+    AnnouncementCreate,
+    AnnouncementResponse,
+    AnnouncementType,
+    AnnouncementUpdate,
+)
+from app.database.audit_log import AuditActionType, AuditLog, AuditLogResponse, TargetType
 from app.database.auth import OAuthToken
-from app.database.announcement import Announcement, AnnouncementCreate, AnnouncementUpdate, AnnouncementResponse, AnnouncementType
-from app.database.audit_log import AuditLog, AuditLogCreate, AuditLogResponse, AuditActionType, TargetType
-from app.database.beatmap import Beatmap, BannedBeatmaps
-from app.models.beatmap import BeatmapRankStatus
-from app.models.score import GameMode
+from app.database.beatmap import BannedBeatmaps, Beatmap
 from app.database.beatmapset import Beatmapset
 from app.database.chat import ChannelType, ChatChannel, ChatMessage, ChatMessageModel, MessageType
-from app.database.client_log import ClientLog, ClientLogCreate, ClientLogResponse, ClientLogType
-from app.database.rank_request import RankRequest, RankRequestCreate, RankRequestUpdate, RankRequestResponse, RankRequestStatus
-from app.database.report import Report, ReportCreate, ReportUpdate, ReportResponse, ReportStatus, ReportType
+from app.database.client_log import ClientLog, ClientLogResponse, ClientLogType
+from app.database.daily_challenge_model import (
+    DailyChallenge,
+    DailyChallengeCreate,
+    DailyChallengeResponse,
+    DailyChallengeUpdate,
+)
+from app.database.rank_request import (
+    RankRequest,
+    RankRequestResponse,
+    RankRequestStatus,
+)
+from app.database.report import Report, ReportResponse, ReportStatus
 from app.database.score import Score
 from app.database.score_token import ScoreToken
 from app.database.statistics import UserStatistics
-from app.database.system_settings import SystemSetting, RecalculationTask, RecalculationTaskCreate, RecalculationTaskResponse, RecalculationStatus, RecalculationType
-from app.database.user_login_log import UserLoginLog
-from app.database.daily_challenge_model import DailyChallenge, DailyChallengeCreate, DailyChallengeUpdate, DailyChallengeResponse
+from app.database.system_settings import (
+    RecalculationStatus,
+    RecalculationTask,
+    RecalculationTaskResponse,
+    RecalculationType,
+    SystemSetting,
+)
 from app.database.team import Team, TeamMember
 from app.database.user import User
 from app.database.user_account_history import UserAccountHistory, UserAccountHistoryType
-from app.database.user_badge import UserBadge, UserBadgeCreate, UserBadgeUpdate, UserBadgeResponse
+from app.database.user_badge import UserBadge, UserBadgeCreate, UserBadgeUpdate
+from app.database.user_login_log import UserLoginLog
 from app.database.verification import LoginSession, LoginSessionResp, TrustedDevice, TrustedDeviceResp
-from app.const import BANCHOBOT_ID
-from app.dependencies.database import Database, get_redis
 from app.dependencies.client_verification import ClientVerificationService
+from app.dependencies.database import Database, get_redis
 from app.dependencies.geoip import GeoIPService, IPAddress
 from app.dependencies.storage import StorageService
 from app.dependencies.user import UserAndToken, get_client_user_and_token
+from app.models.beatmap import BeatmapRankStatus
 from app.models.mods import APIMod, get_available_mods
-from app.models.score import GameMode
 from app.models.notification import ChannelMessage, GlobalAnnouncement, UserAchievementUnlock
+from app.models.score import GameMode
 from app.router.notification.server import server
 from app.service.ranking_cache_service import get_ranking_cache_service
-from app.service.recalculation_service import is_recalculation_running, has_pending_or_running_task, check_concurrent_limit, get_current_task_status
-from app.tasks.recalculation_worker import process_pending_recalculation_tasks
+from app.service.recalculation_service import (
+    check_concurrent_limit,
+    get_current_task_status,
+    has_pending_or_running_task,
+)
 from app.tasks.daily_challenge import create_daily_challenge_room
+from app.tasks.recalculation_worker import process_pending_recalculation_tasks
 from app.utils import check_image, utcnow
 
 from fastapi import APIRouter
 
 router = APIRouter()
 
-import json
-import httpx
 import hashlib
+import json
 import time
-from fastapi import File, Form, HTTPException, Query, Security
-from pydantic import BaseModel, Field, model_validator
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import or_ as sql_or
-from sqlmodel import col, func, select
+
 from app.log import log
+
+from fastapi import File, Form, HTTPException, Query, Security
+import httpx
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import or_ as sql_or
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import col, func, select
 
 logger = log("AdminAPI")
 
@@ -88,11 +115,11 @@ def _extract_os_from_user_agent(user_agent: str | None, client_label: str | None
             os_name = os_match.group(1).strip()
             if os_name.lower() in ("windows", "macos", "ios", "android", "linux"):
                 return os_name
-    
+
     ua = (user_agent or "").lower()
     if not ua:
         return None
-    
+
     import re
     patterns = [
         (r"windows nt 10", "Windows 10"),
@@ -112,7 +139,7 @@ def _extract_os_from_user_agent(user_agent: str | None, client_label: str | None
     for pattern, name in patterns:
         if re.search(pattern, ua):
             return name
-    
+
     return None
 
 async def require_admin(session: Database, user_and_token: UserAndToken) -> User:
@@ -1421,7 +1448,7 @@ async def update_user(
                 # Store as list of badge dicts (JSON-compatible format)
                 # Note: We store as dict with string dates for JSON compatibility, not Badge TypedDict with datetime
                 user.badges = cast(Any, [badge_dict])
-            except (json.JSONDecodeError, TypeError, ValueError) as e:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 # If parsing fails, create a simple badge structure
                 # Note: We store as dict with string dates for JSON compatibility
                 user.badges = cast(Any, [{
@@ -2197,14 +2224,14 @@ async def get_blacklisted_beatmaps(
         # Safely get beatmap properties with fallbacks
         beatmap_dict = {
             "id": beatmap.id,
-            "version": getattr(beatmap, 'version', 'Unknown') or 'Unknown',
-            "difficulty_rating": float(getattr(beatmap, 'difficulty_rating', 0.0) or 0.0),
-            "mode": str(getattr(beatmap, 'mode', 'Unknown') or 'Unknown'),
-            "total_length": int(getattr(beatmap, 'total_length', 0) or 0),
-            "bpm": float(getattr(beatmap, 'bpm', 0.0) or 0.0),
-            "count_circles": int(getattr(beatmap, 'count_circles', 0) or 0),
-            "count_sliders": int(getattr(beatmap, 'count_sliders', 0) or 0),
-            "count_spinners": int(getattr(beatmap, 'count_spinners', 0) or 0),
+            "version": getattr(beatmap, "version", "Unknown") or "Unknown",
+            "difficulty_rating": float(getattr(beatmap, "difficulty_rating", 0.0) or 0.0),
+            "mode": str(getattr(beatmap, "mode", "Unknown") or "Unknown"),
+            "total_length": int(getattr(beatmap, "total_length", 0) or 0),
+            "bpm": float(getattr(beatmap, "bpm", 0.0) or 0.0),
+            "count_circles": int(getattr(beatmap, "count_circles", 0) or 0),
+            "count_sliders": int(getattr(beatmap, "count_sliders", 0) or 0),
+            "count_spinners": int(getattr(beatmap, "count_spinners", 0) or 0),
         }
 
         result.append(
@@ -2261,7 +2288,7 @@ async def add_blacklisted_beatmap(
         if existing_banned:
             raise HTTPException(status_code=400, detail="Beatmap is already blacklisted")
 
-        beatmapset_id_value = getattr(beatmap, 'beatmapset_id', 0) or 0
+        beatmapset_id_value = getattr(beatmap, "beatmapset_id", 0) or 0
 
         session.add(BannedBeatmaps(beatmap_id=beatmap_id))
         await session.commit()
@@ -3167,7 +3194,7 @@ async def delete_team_admin(
         "name": team.name,
         "short_name": team.short_name,
         "leader_id": team.leader_id,
-        "member_count": len(team.members) if hasattr(team, 'members') else 0,
+        "member_count": len(team.members) if hasattr(team, "members") else 0,
     }
 
     # Create audit log
@@ -3398,7 +3425,7 @@ async def create_daily_challenge(
         raise HTTPException(status_code=409, detail="Daily challenge already exists for this date")
 
     # Check if room_id is already used (if provided)
-    if hasattr(challenge_data, 'room_id') and challenge_data.room_id is not None:
+    if hasattr(challenge_data, "room_id") and challenge_data.room_id is not None:
         existing_room_challenge = (
             await session.exec(select(DailyChallenge).where(col(DailyChallenge.room_id) == challenge_data.room_id))
         ).first()
@@ -3412,9 +3439,9 @@ async def create_daily_challenge(
         ruleset_id=challenge_data.ruleset_id,
         required_mods=challenge_data.required_mods,
         allowed_mods=challenge_data.allowed_mods,
-        room_id=getattr(challenge_data, 'room_id', None),
-        max_attempts=getattr(challenge_data, 'max_attempts', None),
-        time_limit=getattr(challenge_data, 'time_limit', None),
+        room_id=getattr(challenge_data, "room_id", None),
+        max_attempts=getattr(challenge_data, "max_attempts", None),
+        time_limit=getattr(challenge_data, "time_limit", None),
     )
 
     # Sync to Redis and optionally create room
@@ -3461,6 +3488,131 @@ async def create_daily_challenge(
     return challenge_res
 
 
+class DailyChallengeRandomRequest(BaseModel):
+    date: str | None = None
+    ruleset_id: int | None = None
+    min_difficulty: float | None = None
+    max_difficulty: float | None = None
+    create_challenge: bool = False
+    required_mods: str = "[]"
+    allowed_mods: str | None = None
+
+
+class DailyChallengeRandomResponse(BaseModel):
+    beatmap_id: int
+    beatmap_title: str
+    beatmap_artist: str
+    difficulty_rating: float
+    ruleset_id: int
+    challenge_created: bool = False
+    challenge_date: str | None = None
+
+
+@router.post(
+    "/admin/daily-challenge/random",
+    name="随机选择每日挑战",
+    tags=["管理", "g0v0 API"],
+    response_model=DailyChallengeRandomResponse,
+)
+async def create_random_daily_challenge(
+    session: Database,
+    request: DailyChallengeRandomRequest,
+    ip_address: IPAddress,
+    user_and_token: Annotated[UserAndToken, Security(get_client_user_and_token)],
+):
+    """Pick a random beatmap for daily challenge, optionally creating a challenge entry (admin only)"""
+    current_user = await require_admin(session, user_and_token)
+
+    from app.service.daily_challenge_service import DailyChallengeService
+
+    excluded_dates = []
+    if request.date:
+        try:
+            request_challenge_date = datetime.strptime(request.date, "%Y-%m-%d").date()
+            excluded_dates = [request_challenge_date]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    else:
+        request_challenge_date = None
+
+    beatmap = await DailyChallengeService.get_random_beatmap_filtered(
+        session=session,
+        ruleset_id=request.ruleset_id,
+        min_difficulty=request.min_difficulty,
+        max_difficulty=request.max_difficulty,
+    )
+
+    if not beatmap:
+        raise HTTPException(status_code=404, detail="No suitable beatmap found matching criteria")
+
+    beatmap_obj = await session.get(Beatmap, beatmap.id)
+    beatmapset = await beatmap_obj.awaitable_attrs.beatmapset if beatmap_obj else None
+
+    response = DailyChallengeRandomResponse(
+        beatmap_id=beatmap.id,
+        beatmap_title=beatmapset.title if beatmapset else "Unknown",
+        beatmap_artist=beatmapset.artist if beatmapset else "Unknown",
+        difficulty_rating=beatmap.difficulty_rating,
+        ruleset_id=int(beatmap.mode),
+    )
+
+    if request.create_challenge and request_challenge_date:
+        existing_challenge = (
+            await session.exec(select(DailyChallenge).where(col(DailyChallenge.date) == request_challenge_date))
+        ).first()
+
+        if existing_challenge:
+            raise HTTPException(status_code=409, detail="Daily challenge already exists for this date")
+
+        allowed_mods_json = request.allowed_mods
+        if allowed_mods_json is None:
+            allowed_mods_json = json.dumps(get_available_mods(request.ruleset_id or int(beatmap.mode), []))
+
+        new_challenge = DailyChallenge(
+            date=request_challenge_date,
+            beatmap_id=beatmap.id,
+            ruleset_id=request.ruleset_id or int(beatmap.mode),
+            required_mods=request.required_mods,
+            allowed_mods=allowed_mods_json,
+        )
+
+        room_id = await sync_daily_challenge_to_redis(
+            challenge_date=request_challenge_date,
+            beatmap_id=beatmap.id,
+            ruleset_id=request.ruleset_id or int(beatmap.mode),
+            required_mods=request.required_mods,
+            allowed_mods=allowed_mods_json,
+        )
+        if room_id is not None:
+            new_challenge.room_id = room_id
+
+        session.add(new_challenge)
+
+        audit_log = AuditLog(
+            actor_id=current_user.id,
+            actor_username=current_user.username,
+            action_type=AuditActionType.ANNOUNCEMENT_CREATE,
+            target_type=TargetType.SYSTEM,
+            target_id=None,
+            target_name="Daily Challenge",
+            reason=f"Created random daily challenge for date {request_challenge_date}",
+            ip_address=ip_address,
+            metadata={
+                "date": str(request_challenge_date),
+                "beatmap_id": beatmap.id,
+                "ruleset_id": request.ruleset_id or int(beatmap.mode),
+                "room_id": room_id,
+            },
+        )
+        session.add(audit_log)
+        await session.commit()
+
+        response.challenge_created = True
+        response.challenge_date = request.date
+
+    return response
+
+
 @router.patch(
     "/admin/daily-challenge/{date}",
     name="更新每日挑战",
@@ -3493,7 +3645,7 @@ async def update_daily_challenge(
     changes = {}
 
     # Update fields if provided
-    if getattr(challenge_data, 'beatmap_id', None) is not None:
+    if getattr(challenge_data, "beatmap_id", None) is not None:
         # Check if new beatmap exists
         beatmap = await session.get(Beatmap, challenge_data.beatmap_id)
         if not beatmap:
@@ -3502,19 +3654,19 @@ async def update_daily_challenge(
             changes["beatmap_id"] = {"old": challenge.beatmap_id, "new": challenge_data.beatmap_id}
         challenge.beatmap_id = challenge_data.beatmap_id
 
-    if getattr(challenge_data, 'ruleset_id', None) is not None and challenge.ruleset_id != challenge_data.ruleset_id:
+    if getattr(challenge_data, "ruleset_id", None) is not None and challenge.ruleset_id != challenge_data.ruleset_id:
         changes["ruleset_id"] = {"old": challenge.ruleset_id, "new": challenge_data.ruleset_id}
         challenge.ruleset_id = challenge_data.ruleset_id
 
-    if getattr(challenge_data, 'required_mods', None) is not None and challenge.required_mods != challenge_data.required_mods:
+    if getattr(challenge_data, "required_mods", None) is not None and challenge.required_mods != challenge_data.required_mods:
         changes["required_mods"] = {"old": challenge.required_mods, "new": challenge_data.required_mods}
         challenge.required_mods = challenge_data.required_mods
 
-    if getattr(challenge_data, 'allowed_mods', None) is not None and challenge.allowed_mods != challenge_data.allowed_mods:
+    if getattr(challenge_data, "allowed_mods", None) is not None and challenge.allowed_mods != challenge_data.allowed_mods:
         changes["allowed_mods"] = {"old": challenge.allowed_mods, "new": challenge_data.allowed_mods}
         challenge.allowed_mods = challenge_data.allowed_mods
 
-    if getattr(challenge_data, 'room_id', None) is not None:
+    if getattr(challenge_data, "room_id", None) is not None:
         # Check if room_id is already used by another challenge
         existing_room_challenge = (
             await session.exec(
@@ -3531,11 +3683,11 @@ async def update_daily_challenge(
             changes["room_id"] = {"old": challenge.room_id, "new": challenge_data.room_id}
         challenge.room_id = challenge_data.room_id
 
-    if getattr(challenge_data, 'max_attempts', None) is not None and challenge.max_attempts != challenge_data.max_attempts:
+    if getattr(challenge_data, "max_attempts", None) is not None and challenge.max_attempts != challenge_data.max_attempts:
         changes["max_attempts"] = {"old": challenge.max_attempts, "new": challenge_data.max_attempts}
         challenge.max_attempts = challenge_data.max_attempts
 
-    if getattr(challenge_data, 'time_limit', None) is not None and challenge.time_limit != challenge_data.time_limit:
+    if getattr(challenge_data, "time_limit", None) is not None and challenge.time_limit != challenge_data.time_limit:
         changes["time_limit"] = {"old": challenge.time_limit, "new": challenge_data.time_limit}
         challenge.time_limit = challenge_data.time_limit
 
