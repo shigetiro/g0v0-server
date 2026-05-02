@@ -13,6 +13,7 @@ from app.database import (
     ScoreToken,
     ScoreTokenResp,
     User,
+    SystemSetting,
 )
 from app.database.user import UserModel
 from app.database.achievement import process_achievements
@@ -248,6 +249,10 @@ async def submit_score(
 ):
     # 立即获取用户ID，避免后续的懒加载问题
     user_id = current_user.id
+    # Reject score submissions during maintenance mode
+    setting = (await db.exec(select(SystemSetting).where(SystemSetting.key == "maintenance_mode"))).first()
+    if setting and setting.value.lower() == "true":
+        raise HTTPException(status_code=503, detail="Server is under maintenance. Score submissions are disabled.")
 
     logger.info(
         "[submit_score] start user_id={} token={} passed={} rank={}",
@@ -359,8 +364,9 @@ async def submit_score(
                 score_id,
             )
 
-            # Failed / quit submissions do not need to block the client on
-            # statistics and leaderboard housekeeping before returning.
+            # Schedule user stats processing as background task for ALL scores
+            # Previously _process_user was awaited inline for passed scores, causing
+    # timeouts because PP calculations blocked the response.
             if score.passed:
                 t_user = time.time()
                 logger.info("[submit_score] BEFORE _process_user score_id={} user_id={}", score_id, user_id)
