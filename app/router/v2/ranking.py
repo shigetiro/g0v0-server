@@ -2,8 +2,8 @@ from typing import Annotated, Any, Literal
 
 from app.config import settings
 from app.database import Team, TeamMember, User, UserStatistics
-from app.database.user import UserModel
 from app.database.statistics import UserStatisticsModel
+from app.database.user import UserModel
 from app.dependencies.database import Database, get_redis
 from app.dependencies.fetcher import get_fetcher
 from app.dependencies.user import get_current_user
@@ -431,6 +431,69 @@ async def get_country_ranking(
 
 
 @router.get(
+    "/rankings/{ruleset}/top-plays",
+    name="获取高分成绩排行",
+    description="获取指定模式下按PP排序的最高分成绩",
+    tags=["排行榜"],
+)
+async def get_top_plays_ranking(
+    session: Database,
+    ruleset: Annotated[str, Path(..., description="指定 ruleset")],
+    page: int = 1,
+):
+    try:
+        mode = GameMode(ruleset)
+    except ValueError:
+        return {"scores": [], "total": 0}
+
+    import logging
+    logging.info(f"mode={mode}, int(mode)={int(mode)}")
+
+    from app.database.score import Score
+    from sqlalchemy.orm import joinedload
+
+    page_size = 50
+    start_idx = (page - 1) * page_size
+
+    scores_result = await session.exec(
+        select(Score)
+        .where(
+            Score.gamemode == mode,
+            Score.pp > 0,
+            Score.passed == True,
+            Score.ranked == True,
+        )
+        .order_by(col(Score.pp).desc())
+        .limit(page_size)
+        .offset(start_idx)
+    )
+
+    scores = scores_result.all()
+    logging.info(f"Query returned {len(scores)} scores, mode={mode}")
+
+    count_result = await session.exec(
+        select(func.count()).select_from(Score).where(
+            Score.gamemode == mode,
+            Score.pp > 0,
+            Score.passed == True,
+            Score.ranked == True,
+        )
+    )
+    total_count = count_result.one()
+
+    scores_data = []
+    for score in scores:
+        score_dict = await score.to_resp(session, 20250913, includes=["beatmap", "beatmapset", "user.country", "user.cover"])
+        scores_data.append(score_dict)
+
+    logging.info(f"Returning {len(scores_data)} scores")
+    return {
+        "scores": scores_data,
+        "total": total_count,
+    }
+
+
+@router.get(
     "/rankings/{ruleset}/{sort}",
     responses={
         200: api_doc(
@@ -639,72 +702,30 @@ async def get_user_ranking(
 
 
 class TopPlaysResponse(BaseModel):
-    scores: list[dict[str, Any]]
+    scores: list[Any]
     total: int
 
 
-@router.get(
-    "/rankings/{ruleset}/top-plays",
-    response_model=TopPlaysResponse,
-    name="获取高分成绩排行",
-    description="获取指定模式下按PP排序的最高分成绩",
-    tags=["排行榜"],
-)
-async def get_top_plays_ranking(
-    session: Database,
-    background_tasks: BackgroundTasks,
-    ruleset: Annotated[GameMode, Path(..., description="指定 ruleset")],
-    current_user: Annotated[User, Security(get_current_user, scopes=["public"])],
-    page: Annotated[int, Query(ge=1, description="页码")] = 1,
+from typing import Annotated, Any, Literal
+
+from app.database import Team, User
+from app.database.statistics import UserStatisticsModel
+from app.dependencies.database import Database
+from app.dependencies.user import get_current_user
+from app.models.score import GameMode
+from app.utils import api_doc
+
+from .router import router
+
+from fastapi import BackgroundTasks, Path, Query, Security
+from pydantic import BaseModel, Field
+
+
+@router.get("/test-top-plays/{mode}")
+async def test_top_plays(
+    mode: str,
 ):
-    from app.database.score import Score
-    from app.database.beatmap import Beatmap
-    from app.database.beatmapset import Beatmapset
-
-    redis = get_redis()
-    cache_service = get_ranking_cache_service(redis)
-
-    # Try to get from cache first
-    cached_data = await cache_service.get_cached_top_plays(ruleset, page)
-    cached_stats = await cache_service.get_cached_top_plays_stats(ruleset)
-
-    if cached_data is not None and cached_stats is not None:
-        return TopPlaysResponse(
-            scores=cached_data,
-            total=cached_stats.get("total", 0),
-        )
-
-    page_size = 50
-    start_idx = (page - 1) * page_size
-
-    scores_result = await session.exec(
-        select(Score)
-        .where(
-            Score.ruleset_id == int(ruleset),
-            Score.pp > 0,
-            Score.passed == True,
-            Score.ranked == True,
-        )
-        .order_by(col(Score.pp).desc())
-        .limit(page_size)
-        .offset(start_idx)
-        .options(
-            joinedload(Score.beatmap),
-            joinedload(Score.beatmapset),
-            joinedload(Score.user),
-        )
-    )
-    scores = scores_result.unique().all()
-
-    count_result = await session.exec(
-        select(func.count()).select_from(Score).where(
-            Score.ruleset_id == int(ruleset),
-            Score.pp > 0,
-            Score.passed == True,
-            Score.ranked == True,
-        )
-    )
-    total_count = count_result.one()
+    return {"mode": mode, "test": "ok"}
 
     scores_data = []
     for score in scores:
@@ -713,26 +734,15 @@ async def get_top_plays_ranking(
         )
         scores_data.append(score_dict)
 
-    cache_scores = scores_data
-    stats_data = {"total": total_count}
+    return {
+        "scores": scores_data,
+        "total": total_count,
+    }
 
-    background_tasks.add_task(
-        cache_service.cache_top_plays,
-        ruleset,
-        cache_scores,
-        page,
-        ttl=settings.ranking_cache_expire_minutes * 60,
-    )
 
-    background_tasks.add_task(
-        cache_service.cache_top_plays_stats,
-        ruleset,
-        stats_data,
-        ttl=settings.ranking_cache_expire_minutes * 60,
-    )
-
-    return TopPlaysResponse(
-        scores=scores_data,
-        total=total_count,
-    )
+@router.get("/test-top-plays/{mode}")
+async def test_top_plays(
+    mode: str,
+):
+    return {"mode": mode, "test": "ok"}
 
