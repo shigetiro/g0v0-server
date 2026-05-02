@@ -12,7 +12,7 @@ from app.dependencies.database import (
     redis_message_client,
     with_db,
 )
-from app.dependencies.user import get_current_user_and_token
+from app.dependencies.user import get_current_user_and_token, _validate_token
 from app.log import log
 from app.models.chat import ChatEvent
 from app.models.notification import NotificationDetail
@@ -22,6 +22,7 @@ from app.utils import bg_tasks, safe_json_dumps
 from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.security import SecurityScopes
 from fastapi.websockets import WebSocketState
+from sqlalchemy.orm import selectinload
 from sqlmodel import select, col, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -30,7 +31,7 @@ logger = log("NotificationServer")
 
 class ChatServer:
     def __init__(self):
-        self.connect_client: dict[int, set[WebSocket]] = {} #to allow both browser and ingame messaging
+        self.connect_client: dict[int, set[WebSocket]] = {}  # to allow both browser and ingame messaging
         self.channels: dict[int, list[int]] = {}
         self.redis: Redis = redis_message_client
 
@@ -43,7 +44,6 @@ class ChatServer:
         if user_id not in self.connect_client:
             self.connect_client[user_id] = set()
         self.connect_client[user_id].add(client)
-
 
     def get_user_joined_channel(self, user_id: int) -> list[int]:
         return [channel_id for channel_id, users in self.channels.items() if user_id in users]
@@ -80,7 +80,6 @@ class ChatServer:
                 ).first()
                 if db_channel:
                     await self.leave_channel(user, db_channel)
-
 
     @overload
     async def send_event(self, client: int, event: ChatEvent): ...
@@ -121,8 +120,6 @@ class ChatServer:
                     ws_set.discard(ws)
                 if not ws_set:
                     self.connect_client.pop(user_id, None)
-
-
 
     async def broadcast(self, channel_id: int, event: ChatEvent):
         users_in_channel = list(self.channels.get(channel_id, []))
@@ -297,7 +294,7 @@ class ChatServer:
 
     async def join_room_channel(self, channel_id: int, user_id: int):
         async with with_db() as session:
-            # 使用明确的查询避免延迟加载
+            # use explicit queries to avoid lazy loading
             db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == channel_id))).first()
             if db_channel is None:
                 logger.warning(f"Attempted to join non-existent channel {channel_id} by user {user_id}")
@@ -313,7 +310,7 @@ class ChatServer:
 
     async def leave_room_channel(self, channel_id: int, user_id: int):
         async with with_db() as session:
-            # 使用明确的查询避免延迟加载
+            # use explicit queries to avoid lazy loading
             db_channel = (await session.exec(select(ChatChannel).where(ChatChannel.channel_id == channel_id))).first()
             if db_channel is None:
                 logger.warning(f"Attempted to leave non-existent channel {channel_id} by user {user_id}")
@@ -328,20 +325,50 @@ class ChatServer:
             await self.leave_channel(user, db_channel)
 
     async def new_private_notification(self, detail: NotificationDetail):
+        logger.info(f"new_private_notification called for {detail.name}, object_id={detail.object_id}")
         async with with_db() as session:
             id = await insert_notification(session, detail)
-            users = (await session.exec(select(UserNotification).where(UserNotification.notification_id == id))).all()
-            for user_notification in users:
-                data = user_notification.notification.model_dump()
-                if data.get("source_user_id") == BANCHOBOT_ID:
-                    data["source_user_id"] = 0
-                data["is_read"] = user_notification.is_read
-                data["details"] = user_notification.notification.details
+            logger.info(f"Notification inserted with id={id}")
+
+        # Use a fresh session to avoid lazy-loading issues after commit
+        async with with_db() as session:
+            # Get notification directly instead of through relationship
+            from app.database.notification import Notification
+
+            notification = await session.get(Notification, id)
+            if not notification:
+                logger.warning(f"Notification {id} not found after creation")
+                return
+
+            # Get user notifications with user_id only
+            user_notifications = (
+                await session.exec(
+                    select(UserNotification.user_id, UserNotification.is_read).where(
+                        UserNotification.notification_id == id
+                    )
+                )
+            ).all()
+
+            # Build data dict manually without accessing relationships
+            data = {
+                "id": notification.id,
+                "name": notification.name.value if notification.name else None,
+                "category": notification.category,
+                "object_type": notification.object_type,
+                "object_id": notification.object_id,
+                "source_user_id": notification.source_user_id
+                if notification.source_user_id != BANCHOBOT_ID
+                else 0,
+                "details": notification.details,
+            }
+
+            for user_id, is_read in user_notifications:
+                event_data = {**data, "is_read": is_read}
                 await server.send_event(
-                    user_notification.user_id,
+                    user_id,
                     ChatEvent(
                         event="new",
-                        data=data,
+                        data=event_data,
                     ),
                 )
 
@@ -371,6 +398,7 @@ async def _listen_stop(ws: WebSocket, user_id: int):
             logger.exception(f"Error in client {user_id}")
             break
 
+
 @chat_router.websocket("/notification-server")
 async def chat_websocket(
     websocket: WebSocket,
@@ -398,11 +426,10 @@ async def chat_websocket(
                 logger.info("WebSocket rejected: missing authentication token")
                 return
 
+            # Direct token validation - WebSockets can't use OAuth2 header dependencies
             try:
-                # Keep websocket auth permissive on scope for compatibility with
-                # older/custom clients that still use "*" password-grant tokens.
-                user_and_token = await get_current_user_and_token(
-                    session, SecurityScopes(scopes=[]), token_pw=auth_token
+                user_and_token = await _validate_token(
+                    session, auth_token, SecurityScopes(scopes=[])
                 )
             except HTTPException as auth_error:
                 await websocket.close(code=1008, reason="Invalid or expired token")
@@ -439,7 +466,7 @@ async def chat_websocket(
             return  # importante: salimos del handler cuando termina
 
     except WebSocketDisconnect as e:
-        # ✅ desconexión normal: NO traceback
+        # desconexión normal: NO traceback
         logger.info(
             f"Client {user_id or 'unknown'} disconnected: "
             f"{e.code}, {getattr(e, 'reason', '')}"

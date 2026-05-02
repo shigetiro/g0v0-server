@@ -14,6 +14,7 @@ from app.database import (
     BeatmapsetModel,
     FavouriteBeatmapset,
     User,
+    UserAccountHistory,
 )
 from app.database.beatmap_playcounts import BeatmapPlaycountsModel
 from app.database.best_scores import BestScore
@@ -47,6 +48,9 @@ from fastapi import BackgroundTasks, HTTPException, Path, Query, Request, Securi
 from sqlalchemy.orm import joinedload
 from sqlmodel import exists, func, select, tuple_
 from sqlmodel.sql.expression import col
+from app.log import log
+
+logger = log("user.v2")
 
 
 def _get_difficulty_reduction_mods() -> set[str]:
@@ -346,8 +350,8 @@ async def get_user_beatmaps_passed(
 async def get_user_info_ruleset(
     session: Database,
     background_task: BackgroundTasks,
-    user_id: Annotated[str, Path(description="ç”¨æˆ· ID æˆ–ç”¨æˆ·å")],
-    ruleset: Annotated[GameMode | None, Path(description="æŒ‡å®š ruleset")],
+    user_id: Annotated[str, Path(description="用户 ID 或 用户名")],
+    ruleset: Annotated[GameMode | None, Path(description="指定 ruleset")],
     pp_variant: Annotated[str | None, Query(description="pp variant: stable / pp_dev")] = None,
     current_user: User | None = Security(get_optional_user, scopes=["public"]),
 ):
@@ -356,12 +360,33 @@ async def get_user_info_ruleset(
     redis = get_redis()
     cache_service = get_user_cache_service(redis)
     show_nsfw_media = await viewer_allows_nsfw_media(current_user)
+    logger.info(f"get_user_info_ruleset called with user_id={user_id}, ruleset={ruleset}")
 
-    # å¦‚æžœæ˜¯æ•°å­—IDï¼Œå…ˆå°è¯•ä»Žç¼“å­˜èŽ·å–ï¼ˆcache stores canonical payloadï¼‰
+    # If it is a number ID, first try to fetch from cache (cache stores canonical payload)
     if user_id.isdigit():
         user_id_int = int(user_id)
         cached_user = await cache_service.get_user_from_cache(user_id_int, ruleset, resolved_pp_variant)
+        logger.info(f"  cached_user: {cached_user is not None}")
         if cached_user and "statistics" in cached_user:
+            # Check account_history in cached response - may be dicts or Pydantic objects
+            account_history = cached_user.get("account_history", [])
+            if account_history:
+                first = account_history[0]
+                if hasattr(first, 'get'):
+                    suspicious_notes = [n for n in account_history if n.get("description") and "suspicious" in n.get("description", "").lower()]
+                else:
+                    suspicious_notes = [n for n in account_history if n.description and "suspicious" in n.description.lower()]
+
+                if suspicious_notes:
+                    reasons = []
+                    for n in suspicious_notes:
+                        if hasattr(n, 'description'):
+                            reasons.append(n.description.replace("[SUSPICIOUS] ", ""))
+                        elif isinstance(n, dict):
+                            reasons.append(n["description"].replace("[SUSPICIOUS] ", ""))
+                    cached_user["is_suspicious"] = True
+                    cached_user["suspicious_reasons"] = reasons
+                    cached_user["trust_score"] = max(0, 100 - len(suspicious_notes) * 10)
             return UserModel.apply_nsfw_media_policy(copy.deepcopy(cached_user), show_nsfw_media)
 
     searched_user = (
@@ -400,7 +425,27 @@ async def get_user_info_ruleset(
 
     user_resp = UserModel.apply_nsfw_media_policy(copy.deepcopy(canonical_user_resp), show_nsfw_media)
 
-    # å¼‚æ­¥ç¼”å­˜ canonical result
+    # Add suspicious info - check if items are dicts or Pydantic objects
+    account_history = canonical_user_resp.get("account_history", [])
+    if account_history:
+        first = account_history[0]
+        if hasattr(first, 'get'):
+            suspicious_notes = [n for n in account_history if n.get("description") and "suspicious" in n.get("description", "").lower()]
+        else:
+            suspicious_notes = [n for n in account_history if n.description and "suspicious" in n.description.lower()]
+
+        if suspicious_notes:
+            reasons = []
+            for n in suspicious_notes:
+                if hasattr(n, 'description'):
+                    reasons.append(n.description.replace("[SUSPICIOUS] ", ""))
+                elif isinstance(n, dict):
+                    reasons.append(n["description"].replace("[SUSPICIOUS] ", ""))
+            user_resp["is_suspicious"] = True
+            user_resp["suspicious_reasons"] = reasons
+            user_resp["trust_score"] = max(0, 100 - len(suspicious_notes) * 10)
+
+    # Asynchronous cache canonical result
     background_task.add_task(cache_service.cache_user, canonical_user_resp, ruleset, None, resolved_pp_variant)
     # Pre-warm the pp_dev variant so toggling is instant.
     if resolved_pp_variant == "stable":
@@ -431,12 +476,28 @@ async def get_user_info(
     redis = get_redis()
     cache_service = get_user_cache_service(redis)
     show_nsfw_media = await viewer_allows_nsfw_media(current_user)
+    logger.info(f"get_user_info called with user_id={user_id}, resolved_pp_variant={resolved_pp_variant}")
 
-    # å¦‚æžœæ˜¯æ•°å­—IDï¼Œå…ˆå°è¯•ä»Žç¼“å­˜èŽ·å–ï¼ˆcache stores canonical payloadï¼‰
+    # If it is a number ID, first try to fetch from cache (cache stores canonical payload)
     if user_id.isdigit():
         user_id_int = int(user_id)
         cached_user = await cache_service.get_user_from_cache(user_id_int, None, resolved_pp_variant)
         if cached_user and "statistics" in cached_user:
+            # Check account_history in cached response
+            account_history = cached_user.get("account_history", [])
+            # Check each note
+            for n in account_history:
+                desc = n.get("description", "")
+                has_suspicious = desc and "suspicious" in desc.lower()
+                logger.info(f"Note check: description={desc}, has_suspicious={has_suspicious}")
+            suspicious_notes = [n for n in account_history if n.get("description") and "suspicious" in n.get("description", "").lower()]
+            if suspicious_notes:
+                logger.info(f"Found suspicious notes: {suspicious_notes}")
+                cached_user["is_suspicious"] = True
+                cached_user["suspicious_reasons"] = [
+                    n["description"].replace("[SUSPICIOUS] ", "") for n in suspicious_notes
+                ]
+                cached_user["trust_score"] = max(0, 100 - len(suspicious_notes) * 10)
             return UserModel.apply_nsfw_media_policy(copy.deepcopy(cached_user), show_nsfw_media)
 
     searched_user = (
@@ -474,7 +535,31 @@ async def get_user_info(
 
     user_resp = UserModel.apply_nsfw_media_policy(copy.deepcopy(canonical_user_resp), show_nsfw_media)
 
-    # å¼‚æ­¥ç¼”å­˜ canonical result
+    # Add suspicious info - check if items are dicts or Pydantic objects
+    account_history = canonical_user_resp.get("account_history", [])
+    if account_history:
+        first = account_history[0]
+        if hasattr(first, 'get'):
+            suspicious_notes = [n for n in account_history if n.get("description") and "suspicious" in n.get("description", "").lower()]
+        else:
+            suspicious_notes = [n for n in account_history if n.description and "suspicious" in n.description.lower()]
+
+        if suspicious_notes:
+            reasons = []
+            for n in suspicious_notes:
+                if hasattr(n, 'description'):
+                    reasons.append(n.description.replace("[SUSPICIOUS] ", ""))
+                elif isinstance(n, dict):
+                    reasons.append(n["description"].replace("[SUSPICIOUS] ", ""))
+            user_resp["is_suspicious"] = True
+            user_resp["suspicious_reasons"] = reasons
+            user_resp["trust_score"] = max(0, 100 - len(suspicious_notes) * 10)
+            # Also add to canonical for caching
+            canonical_user_resp["is_suspicious"] = True
+            canonical_user_resp["suspicious_reasons"] = reasons
+            canonical_user_resp["trust_score"] = max(0, 100 - len(suspicious_notes) * 10)
+
+    # Asynchronous cache canonical result
     background_task.add_task(cache_service.cache_user, canonical_user_resp, None, None, resolved_pp_variant)
     # Pre-warm the pp_dev variant so toggling is instant.
     if resolved_pp_variant == "stable":
