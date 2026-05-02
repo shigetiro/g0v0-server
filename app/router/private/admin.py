@@ -6,6 +6,8 @@ from app.database.auth import OAuthToken
 from app.database.announcement import Announcement, AnnouncementCreate, AnnouncementUpdate, AnnouncementResponse, AnnouncementType
 from app.database.audit_log import AuditLog, AuditLogCreate, AuditLogResponse, AuditActionType, TargetType
 from app.database.beatmap import Beatmap, BannedBeatmaps
+from app.models.beatmap import BeatmapRankStatus
+from app.models.score import GameMode
 from app.database.beatmapset import Beatmapset
 from app.database.chat import ChannelType, ChatChannel, ChatMessage, ChatMessageModel, MessageType
 from app.database.client_log import ClientLog, ClientLogCreate, ClientLogResponse, ClientLogType
@@ -54,6 +56,64 @@ from sqlmodel import col, func, select
 from app.log import log
 
 logger = log("AdminAPI")
+
+
+def _extract_version_from_client_label(client_label: str | None) -> str | None:
+    """Extract version string from client_label (e.g., 'osu! 2024.1.1 (Windows)' -> '2024.1.1')"""
+    if not client_label:
+        return None
+    import re
+    match = re.search(r"(\d{4}\.\d+\.\d+(?:-[\w.]+)?)", client_label)
+    if match:
+        return match.group(1)
+    if "osu!" in client_label.lower():
+        parts = client_label.split()
+        for part in parts:
+            if re.match(r"^\d{4}", part):
+                return part
+    return client_label
+
+
+def _extract_os_from_user_agent(user_agent: str | None, client_label: str | None = None) -> str | None:
+    """Detect OS from user_agent or client_label
+    
+    Priority: 
+    1. Extract from client_label parentheses: "osu! 2024.1.1 (Windows)" -> "Windows"
+    2. Parse from user_agent string
+    """
+    if client_label:
+        import re
+        os_match = re.search(r"\(([^)]+)\)", client_label)
+        if os_match:
+            os_name = os_match.group(1).strip()
+            if os_name.lower() in ("windows", "macos", "ios", "android", "linux"):
+                return os_name
+    
+    ua = (user_agent or "").lower()
+    if not ua:
+        return None
+    
+    import re
+    patterns = [
+        (r"windows nt 10", "Windows 10"),
+        (r"windows nt 6\.3", "Windows 8.1"),
+        (r"windows nt 6\.2", "Windows 8"),
+        (r"windows nt 6\.1", "Windows 7"),
+        (r"windows nt 6\.0", "Windows Vista"),
+        (r"windows nt 5\.1", "Windows XP"),
+        (r"mac os x (\d+[\d_]*)", "macOS"),
+        (r"iphone", "iOS"),
+        (r"ipad", "iPadOS"),
+        (r"ios (\d+[\d_]*)", "iOS"),
+        (r"android", "Android"),
+        (r"linux", "Linux"),
+        (r"freebsd", "FreeBSD"),
+    ]
+    for pattern, name in patterns:
+        if re.search(pattern, ua):
+            return name
+    
+    return None
 
 async def require_admin(session: Database, user_and_token: UserAndToken) -> User:
     """Helper function to check if user is admin"""
@@ -218,6 +278,22 @@ async def user_to_dict(user: User, session: Database) -> dict:
     except Exception:
         user_dict["badges"] = []
 
+    # Add suspicious info from account history
+    try:
+        notes = (
+            await session.exec(
+                select(UserAccountHistory).where(UserAccountHistory.user_id == user.id)
+            )
+        ).all()
+        suspicious_notes = [n for n in notes if n.description and "suspicious" in n.description.lower()]
+        user_dict["is_suspicious"] = any(n.description and "suspicious" in n.description.lower() for n in notes)
+        user_dict["suspicious_reasons"] = [n.description.replace("[SUSPICIOUS] ", "") for n in suspicious_notes if n.description]
+        user_dict["trust_score"] = max(0, 100 - len(suspicious_notes) * 10)
+    except Exception:
+        user_dict["is_suspicious"] = False
+        user_dict["suspicious_reasons"] = []
+        user_dict["trust_score"] = 100
+
     return user_dict
 
 
@@ -262,6 +338,27 @@ class AdminLoginLogListResp(BaseModel):
     page: int
     per_page: int
     logs: list[AdminLoginLogItemResp]
+
+
+class LoginAuditItemResp(BaseModel):
+    id: int
+    user_id: int
+    username: str | None = None
+    client_version: str | None = None
+    os_version: str | None = None
+    client_hash: str | None = None
+    ip_address: str | None = None
+    login_time: datetime
+    login_success: bool
+    login_method: str
+    country_name: str | None = None
+
+
+class LoginAuditListResp(BaseModel):
+    total: int
+    page: int
+    per_page: int
+    logs: list[LoginAuditItemResp]
 
 
 class UnknownClientHashResp(BaseModel):
@@ -717,6 +814,145 @@ async def get_admin_login_logs(
     ]
 
     return AdminLoginLogListResp(total=total, page=page, per_page=per_page, logs=logs)
+
+
+@router.get(
+    "/admin/logs/login-audit",
+    name="Get login audit records",
+    tags=["管理", "g0v0 API"],
+    response_model=LoginAuditListResp,
+)
+async def get_login_audit(
+    session: Database,
+    user_and_token: Annotated[UserAndToken, Security(get_client_user_and_token)],
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    search: str = Query(""),
+    user_id: int | None = Query(None, ge=0),
+    client_version: str | None = Query(None),
+    client_hash: str | None = Query(None),
+    os_version: str | None = Query(None),
+    login_success: bool | None = Query(None),
+    login_method: str | None = Query(None),
+    time_range: str = Query("7d"),
+):
+    """Get login audit records with client version tracking.
+    
+    This endpoint provides detailed login history including:
+    - Client version (extracted from client_label)
+    - OS version (detected from user_agent or client_label)
+    - Client hash
+    - User info
+    - Login status
+    """
+    await require_admin(session, user_and_token)
+
+    time_delta_map = {
+        "24h": timedelta(hours=24),
+        "7d": timedelta(days=7),
+        "30d": timedelta(days=30),
+        "all": None,
+    }
+    time_delta = time_delta_map.get(time_range, timedelta(days=7))
+
+    conditions = []
+    search_value = search.strip()
+
+    if user_id is not None:
+        conditions.append(col(UserLoginLog.user_id) == user_id)
+
+    if login_success is not None:
+        conditions.append(col(UserLoginLog.login_success) == login_success)
+
+    if login_method:
+        conditions.append(col(UserLoginLog.login_method).ilike(f"%{login_method.strip()}%"))
+
+    if client_version:
+        conditions.append(col(UserLoginLog.client_label).ilike(f"%{client_version.strip()}%"))
+
+    if client_hash:
+        normalized = client_hash.strip().lower()
+        conditions.append(col(UserLoginLog.client_hash).ilike(f"%{normalized}%"))
+
+    if os_version:
+        os_search = os_version.strip().lower()
+        conditions.append(
+            sql_or(
+                col(UserLoginLog.user_agent).ilike(f"%{os_search}%"),
+                col(UserLoginLog.client_label).ilike(f"%{os_search}%"),
+            )
+        )
+
+    if search_value:
+        username_ids = (
+            await session.exec(
+                select(User.id).where(col(User.username).ilike(f"%{search_value}%")).limit(500)
+            )
+        ).all()
+
+        text_condition = sql_or(
+            col(UserLoginLog.ip_address).ilike(f"%{search_value}%"),
+            col(UserLoginLog.user_agent).ilike(f"%{search_value}%"),
+            col(UserLoginLog.client_label).ilike(f"%{search_value}%"),
+            col(UserLoginLog.client_hash).ilike(f"%{search_value}%"),
+            col(UserLoginLog.country_name).ilike(f"%{search_value}%"),
+        )
+
+        if search_value.isdigit():
+            text_condition = sql_or(text_condition, col(UserLoginLog.user_id) == int(search_value))
+
+        if username_ids:
+            text_condition = sql_or(text_condition, col(UserLoginLog.user_id).in_(username_ids))
+
+        conditions.append(text_condition)
+
+    if time_delta:
+        cutoff_time = datetime.utcnow() - time_delta
+        conditions.append(col(UserLoginLog.login_time) >= cutoff_time)
+
+    count_stmt = select(func.count()).select_from(UserLoginLog)
+    data_stmt = select(UserLoginLog)
+    if conditions:
+        count_stmt = count_stmt.where(*conditions)
+        data_stmt = data_stmt.where(*conditions)
+
+    total = (await session.exec(count_stmt)).one()
+    rows = (
+        await session.exec(
+            data_stmt.order_by(col(UserLoginLog.login_time).desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+        )
+    ).all()
+
+    user_ids = sorted({row.user_id for row in rows if row.user_id > 0})
+    username_map: dict[int, str] = {}
+    if user_ids:
+        users = (
+            await session.exec(
+                select(User.id, User.username).where(col(User.id).in_(user_ids))
+            )
+        ).all()
+        username_map = {uid: uname for uid, uname in users}
+
+    logs = [
+        LoginAuditItemResp(
+            id=row.id or 0,
+            user_id=row.user_id,
+            username=username_map.get(row.user_id),
+            client_version=_extract_version_from_client_label(row.client_label),
+            os_version=_extract_os_from_user_agent(row.user_agent, row.client_label),
+            client_hash=row.client_hash,
+            ip_address=row.ip_address,
+            login_time=row.login_time,
+            login_success=row.login_success,
+            login_method=row.login_method,
+            country_name=row.country_name,
+        )
+        for row in rows
+    ]
+
+    return LoginAuditListResp(total=total, page=page, per_page=per_page, logs=logs)
 
 
 @router.get(
@@ -2155,6 +2391,8 @@ async def get_beatmaps(
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=100),
     search: str = Query("", description="Search by artist, title, or ID"),
+    rank_status: str = Query("", description="Filter by rank status"),
+    mode: str = Query("", description="Filter by mode"),
 ):
     """Get all beatmaps with pagination (admin only)"""
     await require_admin(session, user_and_token)
@@ -2164,7 +2402,7 @@ async def get_beatmaps(
     # Build query with optional search
     query = select(Beatmapset)
 
-    if search:
+    if search or rank_status or mode:
         search_term = f"%{search}%"
         # Try to parse as ID first
         try:
@@ -2185,8 +2423,25 @@ async def get_beatmaps(
                 )
             )
 
+    # Filter by rank status
+    if rank_status:
+        try:
+            status_enum = BeatmapRankStatus[rank_status.upper()]
+            query = query.where(Beatmapset.beatmap_status == status_enum)
+        except KeyError:
+            pass
+
+    # Filter by mode (subquery for beatmapsets containing this mode)
+    if mode:
+        try:
+            mode_enum = GameMode(mode)
+            beatmap_ids_subquery = select(Beatmap.beatmapset_id).where(Beatmap.mode == mode_enum).distinct()
+            query = query.where(col(Beatmapset.id).in_(beatmap_ids_subquery))
+        except (ValueError, KeyError):
+            pass
+
     # Get total count
-    if search:
+    if search or rank_status or mode:
         total_count = (await session.exec(select(func.count()).select_from(query.subquery()))).one()
     else:
         total_count = (await session.exec(select(func.count()).select_from(Beatmapset))).one()
@@ -4677,6 +4932,92 @@ async def get_client_platform_stats(
     return ClientPlatformStatsListResponse(
         total_users=total_users,
         platforms=platform_stats,
+    )
+
+
+class UserVersionRecordResponse(BaseModel):
+    osu_id: int
+    username: str
+    version: str
+    connect_count: int
+    last_connected: str
+    first_connected: str
+
+
+class UserVersionRecordsListResponse(BaseModel):
+    total: int
+    records: list[UserVersionRecordResponse]
+
+
+@router.get(
+    "/admin/logs/user-version-records",
+    name="获取用户版本记录",
+    tags=["管理", "g0v0 API"],
+    response_model=UserVersionRecordsListResponse,
+)
+async def get_user_version_records(
+    session: Database,
+    user_and_token: Annotated[UserAndToken, Security(get_client_user_and_token)],
+    time_range: str = Query("7d"),
+):
+    """Get user version connection records (admin only)"""
+    await require_admin(session, user_and_token)
+
+    # Calculate time range
+    time_delta_map = {
+        "24h": timedelta(hours=24),
+        "7d": timedelta(days=7),
+        "30d": timedelta(days=30),
+        "all": None,
+    }
+    time_delta = time_delta_map.get(time_range, timedelta(days=7))
+
+    # Build query - aggregate by user and version
+    query = select(
+        ScoreToken.user_id,
+        ScoreToken.client_version,
+        func.count(ScoreToken.id).label("connect_count"),
+        func.max(ScoreToken.created_at).label("last_connected"),
+        func.min(ScoreToken.created_at).label("first_connected"),
+    ).where(
+        col(ScoreToken.client_version).is_not(None),
+        col(ScoreToken.client_version) != "",
+    ).group_by(
+        ScoreToken.user_id,
+        ScoreToken.client_version,
+    )
+
+    if time_delta:
+        cutoff_time = datetime.utcnow() - time_delta
+        query = query.where(col(ScoreToken.created_at) >= cutoff_time)
+
+    results = (await session.exec(query)).all()
+
+    # Fetch usernames
+    user_ids = list(set(r.user_id for r in results))
+    users_query = select(User.id, User.username).where(User.id.in_(user_ids))
+    users_rows = (await session.exec(users_query)).all()
+    username_map = {u.id: u.username for u in users_rows}
+
+    records = []
+    for result in results:
+        records.append(
+            UserVersionRecordResponse(
+                osu_id=result.user_id,
+                username=username_map.get(result.user_id, f"User {result.user_id}"),
+                version=result.client_version or "Unknown",
+                connect_count=result.connect_count,
+                last_connected=result.last_connected.isoformat() if result.last_connected else None,
+                first_connected=result.first_connected.isoformat() if result.first_connected else None,
+            )
+        )
+
+    # Sort by connect_count descending
+    records.sort(key=lambda x: x.connect_count, reverse=True)
+
+    return UserVersionRecordsListResponse(
+        total=len(records),
+        records=records,
     )
 
 
