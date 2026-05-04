@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from typing import Annotated, Any, cast
 
@@ -75,7 +76,7 @@ import time
 
 from app.log import log
 
-from fastapi import File, Form, HTTPException, Query, Security
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Security, UploadFile
 import httpx
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import or_ as sql_or
@@ -312,10 +313,39 @@ async def user_to_dict(user: User, session: Database) -> dict:
                 select(UserAccountHistory).where(UserAccountHistory.user_id == user.id)
             )
         ).all()
-        suspicious_notes = [n for n in notes if n.description and "suspicious" in n.description.lower()]
-        user_dict["is_suspicious"] = any(n.description and "suspicious" in n.description.lower() for n in notes)
-        user_dict["suspicious_reasons"] = [n.description.replace("[SUSPICIOUS] ", "") for n in suspicious_notes if n.description]
-        user_dict["trust_score"] = max(0, 100 - len(suspicious_notes) * 10)
+
+        # Check for manually set trust score from most recent admin note
+        admin_trust_notes = [
+            n for n in notes
+            if n.description and "Trust score updated to" in n.description
+        ]
+        if admin_trust_notes:
+            latest_trust_note = max(admin_trust_notes, key=lambda n: n.timestamp)
+            try:
+                match = re.search(r"Trust score updated to (\d+)", latest_trust_note.description)
+                if match:
+                    user_dict["trust_score"] = int(match.group(1))
+                else:
+                    active_suspicious = [n for n in notes if n.description and n.description.startswith("[SUSPICIOUS]")]
+                    user_dict["trust_score"] = max(0, 100 - len(active_suspicious) * 10)
+            except (ValueError, IndexError):
+                active_suspicious = [n for n in notes if n.description and n.description.startswith("[SUSPICIOUS]")]
+                user_dict["trust_score"] = max(0, 100 - len(active_suspicious) * 10)
+        else:
+            active_suspicious = [n for n in notes if n.description and n.description.startswith("[SUSPICIOUS]")]
+            user_dict["trust_score"] = max(0, 100 - len(active_suspicious) * 10)
+
+        # Only count notes that start with [SUSPICIOUS] (exclude clearance/admin notes)
+        active_suspicious = [
+            n for n in notes
+            if n.description and n.description.startswith("[SUSPICIOUS]")
+        ]
+        user_dict["is_suspicious"] = len(active_suspicious) > 0
+        user_dict["suspicious_reasons"] = [
+            n.description.replace("[SUSPICIOUS] ", "")
+            for n in active_suspicious
+            if n.description
+        ]
     except Exception:
         user_dict["is_suspicious"] = False
         user_dict["suspicious_reasons"] = []
@@ -1856,11 +1886,23 @@ async def unmark_user_suspicious(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Add removal note
+    # Delete all active suspicious notes
+    suspicious_notes = (
+        await session.exec(
+            select(UserAccountHistory).where(
+                UserAccountHistory.user_id == user_id,
+                UserAccountHistory.description.like("[SUSPICIOUS]%"),
+            )
+        )
+    ).all()
+    for note in suspicious_notes:
+        await session.delete(note)
+
+    # Add clearance note
     note = UserAccountHistory(
         user_id=user_id,
         type=UserAccountHistoryType.NOTE,
-        description="[SUSPICIOUS] Status cleared by admin",
+        description="Suspicious status cleared by admin",
         length=0,
         permanent=False,
     )
@@ -2996,6 +3038,81 @@ async def delete_user_badge(
     # Delete the badge
     await session.delete(badge)
     await session.commit()
+
+
+# ========== Badge Image Upload ==========
+
+@router.post(
+    "/admin/upload-badge-image",
+    name="上传徽章图片",
+    tags=["管理", "g0v0 API"],
+    status_code=201,
+)
+async def upload_badge_image(
+    session: Database,
+    file: UploadFile,
+    user_and_token: Annotated[UserAndToken, Security(get_client_user_and_token)],
+):
+    """Upload a badge image and return the URL (admin only)"""
+    from pathlib import Path
+    from datetime import datetime
+    import os
+
+    await require_admin(session, user_and_token)
+
+    # Validate file type
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    # Validate file size (5MB max)
+    MAX_SIZE = 5 * 1024 * 1024  # 5MB
+    file.file.seek(0, 2)  # Seek to end
+    file_size = file.file.tell()
+    file.file.seek(0)  # Reset to beginning
+    if file_size > MAX_SIZE:
+        raise HTTPException(status_code=400, detail="File size must be less than 5MB")
+
+    # Save to the Website frontend's public directory so it can serve the images
+    # Try multiple possible paths for different environments
+    possible_paths = [
+        Path("/root/osu/frontend/lazer-frontend/m1-lazer-web-main/public/image/badges"),  # Linux production
+        Path("../Website/public/image/badges"),  # Windows relative
+        Path("../../Website/public/image/badges"),  # Alternative Windows relative
+        Path("D:/Osu Server/Website/public/image/badges"),  # Absolute Windows path
+        Path("static/badges"),  # fallback
+    ]
+
+    badges_dir = None
+    for path in possible_paths:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            badges_dir = path
+            break
+        except:
+            continue
+
+    if not badges_dir:
+        badges_dir = Path("static/badges")
+        badges_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_ext = Path(file.filename).suffix or ".png"
+    filename = f"badge_{timestamp}{file_ext}"
+    file_path = badges_dir / filename
+
+    # Save the file
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # Return the URL (relative to the website domain)
+    # Since the file is saved to the website's public directory,
+    # the URL should be relative to the website's base URL
+    image_url = f"/image/badges/{filename}"
+
+    return {"url": image_url, "message": "Image uploaded successfully"}
 
 
 # ========== Team Management ==========
