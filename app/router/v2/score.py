@@ -238,6 +238,39 @@ async def _process_user_background(score_id: int, user_id: int, redis: Redis, fe
         )
 
 
+async def _run_anticheat_analysis(score_id: int, user_id: int, beatmap_id: int, score_info: object) -> None:
+    try:
+        from app.plugins import plugin_manager
+
+        anticheat = plugin_manager.loaded_plugins.get("anticheat")
+        if not anticheat:
+            return
+
+        score_data = {
+            "score_id": score_id,
+            "user_id": user_id,
+            "beatmap_id": beatmap_id,
+            "accuracy": getattr(score_info, "accuracy", 0),
+            "pp": getattr(score_info, "pp", 0),
+            "total_score": getattr(score_info, "total_score", 0),
+            "max_combo": getattr(score_info, "max_combo", 0),
+            "rank": str(getattr(score_info, "rank", "")),
+            "mods": [m.get("acronym", "") for m in getattr(score_info, "mods", [])],
+            "statistics": getattr(score_info, "statistics", {}),
+            "maximum_statistics": getattr(score_info, "maximum_statistics", {}),
+        }
+
+        stats = score_data.get("statistics", {}) or {}
+        score_data["n300"] = stats.get("great", 0)
+        score_data["n100"] = stats.get("ok", 0)
+        score_data["n50"] = stats.get("meh", 0)
+        score_data["nmiss"] = stats.get("miss", 0)
+
+        await anticheat.analyze_score(score_id, user_id, beatmap_id, score_data)
+    except Exception:
+        logger.exception("[anticheat] Analysis failed for score %d", score_id)
+
+
 async def submit_score(
     background_task: BackgroundTasks,
     info: SoloScoreSubmissionInfo,
@@ -424,6 +457,9 @@ async def submit_score(
 
     # Achievements can stay async
     background_task.add_task(_process_user_achievement, resp["id"])
+
+    # Anticheat analysis (non-blocking background task)
+    background_task.add_task(_run_anticheat_analysis, resp["id"], user_id, beatmap, info)
 
     logger.info("[submit_score] END user_id={} score_id={}", user_id, resp["id"])
     return resp
