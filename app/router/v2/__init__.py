@@ -5,6 +5,7 @@ from . import ( # noqa: F401
     client_logs,
     me,
     misc,
+    private_anticheat,
     ranking,
     relationship,
     room,

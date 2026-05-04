@@ -58,11 +58,13 @@ from app.tasks import (
     stop_recalculation_worker,
 )
 from app.utils import bg_tasks, utcnow
+from app.plugins import plugin_manager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi_limiter import FastAPILimiter
 import sentry_sdk
 
@@ -113,6 +115,9 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     start_scheduler()
     await user_online_subscriber.start_subscribe()
 
+    # init plugins
+    await plugin_manager.load_all()
+
     # show the status of AssetProxy
     if settings.enable_asset_proxy:
         system_logger("AssetProxy").info(f"Asset Proxy enabled - Domain: {settings.custom_asset_domain}")
@@ -120,6 +125,9 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     yield
 
     # === on shutdown ===
+    # stop plugins
+    await plugin_manager.shutdown_all()
+
     # stop services
     bg_tasks.stop()
     await stop_cache_tasks()
@@ -238,6 +246,9 @@ app.add_middleware(
 
 if settings.frontend_url is not None:
     app.include_router(redirect_router)
+
+# Serve static files (for uploaded images like badges)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/users/{user_id}/avatar", include_in_schema=False)

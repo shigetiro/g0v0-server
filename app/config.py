@@ -739,6 +739,13 @@ CALCULATOR_CONFIG='{}'
         "åä½œå¼Šè®¾ç½®",
     ]
 
+    plugin_dirs: Annotated[
+        list[str],
+        Field(default=["./plugins"], description="插件目录列表"),
+        "插件设置",
+    ]
+
+
     # å­˜å‚¨è®¾ç½®
     storage_service: Annotated[
         StorageServiceType,
